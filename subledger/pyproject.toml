@@ -1,0 +1,21 @@
+[project]
+name = "subledger"
+version = "0.1.0"
+description = "Virtual sub-account router for a single real brokerage account (Alpaca now, IB later)"
+requires-python = ">=3.9"
+dependencies = []
+
+[project.scripts]
+subledger = "subledger.cli:main"
+
+[project.optional-dependencies]
+alpaca = ["alpaca-py>=0.30"]
+api = ["fastapi[standard]>=0.110", "uvicorn>=0.29"]
+all = ["alpaca-py>=0.30", "fastapi[standard]>=0.110", "uvicorn>=0.29"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["subledger*"]
