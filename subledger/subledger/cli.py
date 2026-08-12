@@ -26,9 +26,10 @@ Commands
            ledger positions grouped by sub-account (with per-account value
            subtotals); --broker shows the REAL account's net positions with
            the ledger aggregate for comparison
-  equity   [--sub ID] [--since YYYY-MM-DD] [--limit N]
-           equity history (per sub-account time series; the daemon records
-           a row every minute during market hours)
+  equity   [--sub ID] performance view: current equity, today's P&L,
+           total P&L, max drawdown, sparkline (built from the per-minute
+           history the daemon records). --raw dumps the raw time series
+           [--since YYYY-MM-DD] [--limit N]
   history  [--sub ID] [--symbol S] [--since YYYY-MM-DD] [--limit N]
            trade history: orders with fills, newest first
   orders   [--sub ID] [--open] [--limit N]
@@ -218,6 +219,8 @@ def run(stack, argv) -> int:
     p_equity.add_argument("--sub", default=None)
     p_equity.add_argument("--since", default=None, help="YYYY-MM-DD")
     p_equity.add_argument("--limit", type=int, default=50)
+    p_equity.add_argument("--raw", action="store_true",
+                          help="raw per-minute rows instead of the performance summary")
 
     p_history = sub.add_parser("history")
     p_history.add_argument("--sub", default=None)
@@ -481,19 +484,87 @@ def _dispatch(args, ledger, broker, router) -> int:
                     str(c["allow_short"]), c["name"]))
 
     elif args.command == "equity":
-        rows = ledger.equity_history(args.sub, since=args.since, limit=args.limit)
+        if args.raw:
+            rows = ledger.equity_history(args.sub, since=args.since, limit=args.limit)
+            if args.json:
+                _emit(rows, True)
+            else:
+                fmt = "{:20s} {:6s} {:>14s} {:>14s} {:>14s} {:>11s} {:>11s}"
+                print(fmt.format("at", "sub", "cash", "positions", "equity",
+                                 "realized", "unrealized"))
+                for r in rows:
+                    print(fmt.format(r["at"][:19], r["sub_account_id"], _money(r["cash"]),
+                                     _money(r["positions_value"], dash_zero=True),
+                                     _money(r["equity"]),
+                                     _money(r["realized_pnl"], dash_zero=True),
+                                     _money(r["unrealized_pnl"], dash_zero=True)))
+            return 0
+
+        BLOCKS = "▁▂▃▄▅▆▇█"
+
+        def spark(values, width):
+            if not values:
+                return ""
+            if len(values) > width:            # sample down to width points
+                step = len(values) / width
+                values = [values[int(i * step)] for i in range(width)]
+            lo, hi = min(values), max(values)
+            if hi == lo:
+                return BLOCKS[0] * len(values)
+            return "".join(BLOCKS[int((v - lo) / (hi - lo) * (len(BLOCKS) - 1))]
+                           for v in values)
+
+        def perf(sub_id):
+            rows = list(reversed(ledger.equity_history(sub_id, limit=5000)))
+            if not rows:
+                return None
+            pnl = [Decimal(r["realized_pnl"]) + Decimal(r["unrealized_pnl"]) for r in rows]
+            latest = rows[-1]
+            day = latest["at"][:10]
+            day_rows = [i for i, r in enumerate(rows) if r["at"][:10] == day]
+            day_pnl = pnl[-1] - pnl[day_rows[0]] if day_rows else Decimal("0")
+            peak_eq, dd = Decimal(rows[0]["equity"]), Decimal("0")
+            run_max = pnl[0]
+            for i, v in enumerate(pnl):
+                run_max = max(run_max, v)
+                peak_eq = max(peak_eq, Decimal(rows[i]["equity"]))
+                dd = min(dd, v - run_max)
+            eq = Decimal(latest["equity"])
+            return {
+                "sub_account_id": sub_id,
+                "equity": str(eq),
+                "day_pnl": str(day_pnl),
+                "total_pnl": str(pnl[-1]),
+                "max_drawdown": str(dd),
+                "max_drawdown_pct": str((dd / peak_eq * 100).quantize(Decimal("0.01"))) if peak_eq else "0",
+                "rows": len(rows),
+                "since": rows[0]["at"][:16],
+                "_spark_day": spark([float(pnl[i]) for i in day_rows], 24),
+                "_spark_all": spark([float(v) for v in pnl], 60),
+            }
+
+        subs = [args.sub] if args.sub else [a.id for a in ledger.list_sub_accounts()]
+        reports = [r for r in (perf(x) for x in subs) if r]
         if args.json:
-            _emit(rows, True)
+            _emit([{k: v for k, v in r.items() if not k.startswith("_")}
+                   for r in reports], True)
+        elif args.sub and reports:
+            r = reports[0]
+            print("[{}]  since {}  ({} rows)".format(r["sub_account_id"], r["since"], r["rows"]))
+            print("equity    {:>14s}".format(_money(r["equity"])))
+            print("today     {:>14s}".format(_money(r["day_pnl"])))
+            print("total P&L {:>14s}".format(_money(r["total_pnl"])))
+            print("max DD    {:>14s}  ({}%)".format(_money(r["max_drawdown"]), r["max_drawdown_pct"]))
+            print("P&L curve {}".format(r["_spark_all"]))
         else:
-            fmt = "{:20s} {:6s} {:>14s} {:>14s} {:>14s} {:>11s} {:>11s}"
-            print(fmt.format("at", "sub", "cash", "positions", "equity",
-                             "realized", "unrealized"))
-            for r in rows:
-                print(fmt.format(r["at"][:19], r["sub_account_id"], _money(r["cash"]),
-                                 _money(r["positions_value"], dash_zero=True),
-                                 _money(r["equity"]),
-                                 _money(r["realized_pnl"], dash_zero=True),
-                                 _money(r["unrealized_pnl"], dash_zero=True)))
+            fmt = "{:6s} {:>14s} {:>11s} {:>11s} {:>11s} {:>7s}  {}"
+            print(fmt.format("id", "equity", "today", "total", "maxDD", "DD%", "today's P&L"))
+            for r in reports:
+                print(fmt.format(r["sub_account_id"], _money(r["equity"]),
+                                 _money(r["day_pnl"], dash_zero=True),
+                                 _money(r["total_pnl"], dash_zero=True),
+                                 _money(r["max_drawdown"], dash_zero=True),
+                                 r["max_drawdown_pct"], r["_spark_day"]))
 
     elif args.command in ("history", "orders"):
         orders = ledger.list_orders(
