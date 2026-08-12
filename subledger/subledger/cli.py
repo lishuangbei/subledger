@@ -30,6 +30,10 @@ Commands
            total P&L, max drawdown, sparkline (built from the per-minute
            history the daemon records). --raw dumps the raw time series
            [--since YYYY-MM-DD] [--limit N]
+  returns  [--sub ID]
+           per-account returns from past anchors to now, near -> far:
+           today, 1W, 1M, 6M, YTD, 1Y. Each window shows gain%% and CAGR;
+           windows predating the data fall back to inception (marked *)
   history  [--sub ID] [--symbol S] [--since YYYY-MM-DD] [--limit N]
            trade history: orders with fills, newest first
   orders   [--sub ID] [--open] [--limit N]
@@ -221,6 +225,9 @@ def run(stack, argv) -> int:
     p_equity.add_argument("--limit", type=int, default=50)
     p_equity.add_argument("--raw", action="store_true",
                           help="raw per-minute rows instead of the performance summary")
+
+    p_returns = sub.add_parser("returns")
+    p_returns.add_argument("--sub", default=None)
 
     p_history = sub.add_parser("history")
     p_history.add_argument("--sub", default=None)
@@ -565,6 +572,81 @@ def _dispatch(args, ledger, broker, router) -> int:
                                  _money(r["total_pnl"], dash_zero=True),
                                  _money(r["max_drawdown"], dash_zero=True),
                                  r["max_drawdown_pct"], r["_spark_day"]))
+
+    elif args.command == "returns":
+        import datetime as _dt
+
+        now = _dt.datetime.now(_dt.timezone.utc)
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = now.astimezone(ZoneInfo("America/New_York"))
+        except Exception:
+            now_et = now
+        windows = [
+            ("today", now_et.replace(hour=0, minute=0, second=0, microsecond=0)
+                            .astimezone(_dt.timezone.utc), False),
+            ("1W", now - _dt.timedelta(days=7), True),
+            ("1M", now - _dt.timedelta(days=30), True),
+            ("6M", now - _dt.timedelta(days=182), True),
+            ("YTD", now_et.replace(month=1, day=1, hour=0, minute=0, second=0,
+                                   microsecond=0).astimezone(_dt.timezone.utc), True),
+            ("1Y", now - _dt.timedelta(days=365), True),
+        ]
+
+        def account_returns(sub_id):
+            rows = list(reversed(ledger.equity_history(sub_id, limit=100000)))
+            if not rows:
+                return None
+            def pnl(r):
+                return Decimal(r["realized_pnl"]) + Decimal(r["unrealized_pnl"])
+            latest = rows[-1]
+            out = {"sub_account_id": sub_id, "equity": latest["equity"], "windows": []}
+            for name, target, want_cagr in windows:
+                tgt = target.isoformat()
+                base, clipped = None, False
+                for r in rows:                    # last row at-or-before target
+                    if r["at"] <= tgt:
+                        base = r
+                    else:
+                        break
+                if base is None:
+                    base, clipped = rows[0], True
+                base_eq = Decimal(base["equity"])
+                gain = pnl(latest) - pnl(base)
+                ret = (gain / base_eq * 100) if base_eq else Decimal("0")
+                days = max((now - _dt.datetime.fromisoformat(base["at"])).total_seconds() / 86400, 0.5)
+                cagr = None
+                if want_cagr and base_eq:
+                    try:
+                        cagr = (float(1 + gain / base_eq) ** (365.25 / days) - 1) * 100
+                    except (OverflowError, ValueError):
+                        cagr = None
+                out["windows"].append({
+                    "window": name, "clipped": clipped,
+                    "gain": str(gain), "return_pct": str(ret.quantize(Decimal("0.01"))),
+                    "cagr_pct": None if cagr is None else "{:.2f}".format(cagr),
+                    "base_at": base["at"][:16],
+                })
+            return out
+
+        subs = [args.sub] if args.sub else [a.id for a in ledger.list_sub_accounts()]
+        reports = [r for r in (account_returns(x) for x in subs) if r]
+        if args.json:
+            _emit(reports, True)
+        else:
+            names = [w[0] for w in windows]
+            head = "{:6s} {:>14s} " + " ".join(["{:>10s}"] * len(names))
+            print(head.format("id", "equity", *names))
+            for r in reports:
+                cells, cagrs = [], []
+                for w in r["windows"]:
+                    star = "*" if w["clipped"] else ""
+                    cells.append("{}%{}".format(w["return_pct"], star))
+                    cagrs.append("-" if w["cagr_pct"] is None
+                                 else "{}%{}".format(w["cagr_pct"], "*" if w["clipped"] else ""))
+                print(head.format(r["sub_account_id"], _money(r["equity"]), *cells))
+                print(head.format("", "CAGR", *cagrs))
+            print("(* = 窗口早于数据起点,按起点计算;涨幅=ΔP&L/期初净值,资金划拨免疫)")
 
     elif args.command in ("history", "orders"):
         orders = ledger.list_orders(
