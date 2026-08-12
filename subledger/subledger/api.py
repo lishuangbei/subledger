@@ -30,6 +30,62 @@ from .models import (
 from .reconciler import Reconciler
 from .router import OrderRejected, Router
 
+try:
+    from pydantic import BaseModel as _BaseModel
+    _HAVE_PYDANTIC = True
+except ImportError:            # zero-dep core: models only exist with REST deps
+    _HAVE_PYDANTIC = False
+
+if _HAVE_PYDANTIC:
+    # NOTE: these MUST live at module level. With `from __future__ import
+    # annotations` every endpoint annotation is a string that FastAPI
+    # resolves against module globals — function-local classes are invisible
+    # there, and FastAPI silently degrades the body param to a required
+    # query field (every write endpoint 422s).
+
+    class TakeProfitBody(_BaseModel):
+        limit_price: str
+
+    class StopLossBody(_BaseModel):
+        stop_price: str
+        limit_price: Optional[str] = None
+
+    class CreateAccountBody(_BaseModel):
+        id: str
+        name: str = ""
+        allocation: str = "0"
+        margin_multiplier: str = "1"
+        max_order_notional: Optional[str] = None
+        daily_loss_limit: Optional[str] = None
+        symbol_whitelist: Optional[list] = None
+        allow_short: bool = False
+
+    class OrderBody(_BaseModel):
+        sub_account_id: str
+        symbol: str
+        side: str
+        qty: str = "0"
+        notional: Optional[str] = None
+        order_type: str = "market"
+        limit_price: Optional[str] = None
+        stop_price: Optional[str] = None
+        trail_percent: Optional[str] = None
+        trail_price: Optional[str] = None
+        time_in_force: str = "day"
+        extended_hours: bool = False
+        order_class: str = "simple"
+        take_profit: Optional[TakeProfitBody] = None
+        stop_loss: Optional[StopLossBody] = None
+        client_tag: Optional[str] = None
+
+    class AllocateBody(_BaseModel):
+        amount: str
+
+    class ReplaceBody(_BaseModel):
+        qty: Optional[str] = None
+        limit_price: Optional[str] = None
+        stop_price: Optional[str] = None
+
 
 def _build_stack():
     """Assemble ledger/broker/router from environment variables."""
@@ -60,12 +116,15 @@ def _build_stack():
     return ledger, broker, router, reconciler
 
 
-def create_app():
+def create_app(stack=None, background_loops: bool = True):
+    """stack: pass an existing (ledger, broker, router, reconciler) to host
+    the API inside the process that already owns the ledger's writer lock
+    (e.g. a trading daemon). background_loops=False skips the built-in
+    sync/reconcile timers when the host process runs its own."""
     from fastapi import FastAPI, HTTPException
-    from pydantic import BaseModel
 
-    ledger, broker, router, reconciler = _build_stack()
-    app = FastAPI(title="subledger", version="0.1.0")
+    ledger, broker, router, reconciler = stack if stack is not None else _build_stack()
+    app = FastAPI(title="subledger", version="0.5.0")
 
     # Background loops: fill sync every few seconds, reconcile on a timer.
     sync_interval = float(os.environ.get("SUBLEDGER_SYNC_INTERVAL", "5"))
@@ -86,50 +145,8 @@ def create_app():
                 logging.getLogger("subledger.api").exception("background loop error")
             time.sleep(sync_interval)
 
-    threading.Thread(target=_loop, daemon=True).start()
-
-    class CreateAccountBody(BaseModel):
-        id: str
-        name: str = ""
-        allocation: str = "0"
-        margin_multiplier: str = "1"
-        max_order_notional: Optional[str] = None
-        daily_loss_limit: Optional[str] = None
-        symbol_whitelist: Optional[list] = None
-        allow_short: bool = False
-
-    class TakeProfitBody(BaseModel):
-        limit_price: str
-
-    class StopLossBody(BaseModel):
-        stop_price: str
-        limit_price: Optional[str] = None
-
-    class OrderBody(BaseModel):
-        sub_account_id: str
-        symbol: str
-        side: str
-        qty: str = "0"
-        notional: Optional[str] = None
-        order_type: str = "market"
-        limit_price: Optional[str] = None
-        stop_price: Optional[str] = None
-        trail_percent: Optional[str] = None
-        trail_price: Optional[str] = None
-        time_in_force: str = "day"
-        extended_hours: bool = False
-        order_class: str = "simple"
-        take_profit: Optional[TakeProfitBody] = None
-        stop_loss: Optional[StopLossBody] = None
-        client_tag: Optional[str] = None
-
-    class ReplaceBody(BaseModel):
-        qty: Optional[str] = None
-        limit_price: Optional[str] = None
-        stop_price: Optional[str] = None
-
-    class AllocateBody(BaseModel):
-        amount: str
+    if background_loops:
+        threading.Thread(target=_loop, daemon=True).start()
 
     @app.post("/accounts")
     def create_account(body: CreateAccountBody):

@@ -44,7 +44,7 @@ Stack comes from the environment (same as the REST layer):
   ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER
 
 `--json` prints machine-readable output; without it, human tables.
-`--<subid>` (all digits) is shorthand for `--sub <subid>`, e.g. `positions --4755`.
+`--<subid>` (all digits) is shorthand for `--sub <subid>`, e.g. `positions --1001`.
 """
 
 from __future__ import annotations
