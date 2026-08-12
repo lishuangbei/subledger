@@ -32,8 +32,8 @@ Commands
            [--since YYYY-MM-DD] [--limit N]
   returns  [--sub ID]
            per-account returns from past anchors to now, near -> far:
-           today, 1W, 1M, 6M, YTD, 1Y. Each window shows gain%% and CAGR;
-           windows predating the data fall back to inception (marked *)
+           today, 1W, 1M, 6M, YTD, 1Y (gain%%; windows predating the
+           data fall back to inception, marked *)
   history  [--sub ID] [--symbol S] [--since YYYY-MM-DD] [--limit N]
            trade history: orders with fills, newest first
   orders   [--sub ID] [--open] [--limit N]
@@ -584,13 +584,13 @@ def _dispatch(args, ledger, broker, router) -> int:
             now_et = now
         windows = [
             ("today", now_et.replace(hour=0, minute=0, second=0, microsecond=0)
-                            .astimezone(_dt.timezone.utc), False),
-            ("1W", now - _dt.timedelta(days=7), True),
-            ("1M", now - _dt.timedelta(days=30), True),
-            ("6M", now - _dt.timedelta(days=182), True),
+                            .astimezone(_dt.timezone.utc)),
+            ("1W", now - _dt.timedelta(days=7)),
+            ("1M", now - _dt.timedelta(days=30)),
+            ("6M", now - _dt.timedelta(days=182)),
             ("YTD", now_et.replace(month=1, day=1, hour=0, minute=0, second=0,
-                                   microsecond=0).astimezone(_dt.timezone.utc), True),
-            ("1Y", now - _dt.timedelta(days=365), True),
+                                   microsecond=0).astimezone(_dt.timezone.utc)),
+            ("1Y", now - _dt.timedelta(days=365)),
         ]
 
         def account_returns(sub_id):
@@ -601,7 +601,7 @@ def _dispatch(args, ledger, broker, router) -> int:
                 return Decimal(r["realized_pnl"]) + Decimal(r["unrealized_pnl"])
             latest = rows[-1]
             out = {"sub_account_id": sub_id, "equity": latest["equity"], "windows": []}
-            for name, target, want_cagr in windows:
+            for name, target in windows:
                 tgt = target.isoformat()
                 base, clipped = None, False
                 for r in rows:                    # last row at-or-before target
@@ -614,17 +614,9 @@ def _dispatch(args, ledger, broker, router) -> int:
                 base_eq = Decimal(base["equity"])
                 gain = pnl(latest) - pnl(base)
                 ret = (gain / base_eq * 100) if base_eq else Decimal("0")
-                days = max((now - _dt.datetime.fromisoformat(base["at"])).total_seconds() / 86400, 0.5)
-                cagr = None
-                if want_cagr and base_eq:
-                    try:
-                        cagr = (float(1 + gain / base_eq) ** (365.25 / days) - 1) * 100
-                    except (OverflowError, ValueError):
-                        cagr = None
                 out["windows"].append({
                     "window": name, "clipped": clipped,
                     "gain": str(gain), "return_pct": str(ret.quantize(Decimal("0.01"))),
-                    "cagr_pct": None if cagr is None else "{:.2f}".format(cagr),
                     "base_at": base["at"][:16],
                 })
             return out
@@ -638,14 +630,9 @@ def _dispatch(args, ledger, broker, router) -> int:
             head = "{:6s} {:>14s} " + " ".join(["{:>10s}"] * len(names))
             print(head.format("id", "equity", *names))
             for r in reports:
-                cells, cagrs = [], []
-                for w in r["windows"]:
-                    star = "*" if w["clipped"] else ""
-                    cells.append("{}%{}".format(w["return_pct"], star))
-                    cagrs.append("-" if w["cagr_pct"] is None
-                                 else "{}%{}".format(w["cagr_pct"], "*" if w["clipped"] else ""))
+                cells = ["{}%{}".format(w["return_pct"], "*" if w["clipped"] else "")
+                         for w in r["windows"]]
                 print(head.format(r["sub_account_id"], _money(r["equity"]), *cells))
-                print(head.format("", "CAGR", *cagrs))
             print("(* = 窗口早于数据起点,按起点计算;涨幅=ΔP&L/期初净值,资金划拨免疫)")
 
     elif args.command in ("history", "orders"):
