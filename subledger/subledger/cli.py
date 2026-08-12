@@ -19,7 +19,10 @@ Commands
            one sub-account in depth (balances, buying power, positions,
            open orders) — or every account plus pool, totals and the
            latest reconciliation
-  positions [--sub ID]
+  positions [--sub ID] [--broker]
+           ledger positions grouped by sub-account (with per-account value
+           subtotals); --broker shows the REAL account's net positions with
+           the ledger aggregate for comparison
   equity   [--sub ID] [--since YYYY-MM-DD] [--limit N]
            equity history (per sub-account time series; the daemon records
            a row every minute during market hours)
@@ -33,6 +36,7 @@ Stack comes from the environment (same as the REST layer):
   ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER
 
 `--json` prints machine-readable output; without it, human tables.
+`--<subid>` (all digits) is shorthand for `--sub <subid>`, e.g. `positions --4755`.
 """
 
 from __future__ import annotations
@@ -147,9 +151,19 @@ def _orders_table(rows):
 
 def run(stack, argv) -> int:
     """stack = (ledger, broker, router, reconciler); argv excludes program name."""
-    ledger, broker, router, reconciler = stack
+    import re as _re
 
-    parser = argparse.ArgumentParser(prog="subledger", description=__doc__,
+    ledger, broker, router, reconciler = stack
+    expanded = []
+    for token in argv:
+        m = _re.fullmatch(r"--(\d+)", token)
+        expanded += ["--sub", m.group(1)] if m else [token]
+    argv = expanded
+
+    import os as _os_prog
+
+    parser = argparse.ArgumentParser(prog=_os_prog.environ.get("SUBLEDGER_PROG", "subledger"),
+                                     description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -311,13 +325,24 @@ def _dispatch(args, ledger, broker, router) -> int:
         } for p in ledger.list_positions(args.sub) if p.qty != 0 or p.reserved_qty != 0]
 
         def _positions_table(items):
-            fmt = "{:6s} {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>12s}"
-            print(fmt.format("sub", "symbol", "qty", "reserved",
-                             "avg_cost", "last", "uPnL"))
+            from collections import OrderedDict
+            groups = OrderedDict()
             for r in items:
-                print(fmt.format(r["sub_account_id"], r["symbol"], r["qty"],
-                                 r["reserved_qty"], _money(r["avg_cost"]),
-                                 _money(r["last_price"]), _money(r["unrealized_pnl"])))
+                groups.setdefault(r["sub_account_id"], []).append(r)
+            fmt = "  {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>13s} {:>13s}"
+            for sub_id, rows_ in groups.items():
+                value = sum(Decimal(r["qty"]) * Decimal(r["last_price"]) for r in rows_)
+                upnl = sum(Decimal(r["unrealized_pnl"]) for r in rows_)
+                print("[{}]  {} 仓位  市值 {}  浮盈 {}".format(
+                    sub_id, len(rows_), _money(value), _money(upnl)))
+                print(fmt.format("symbol", "qty", "reserved",
+                                 "avg_cost", "last", "mkt_value", "uPnL"))
+                for r in rows_:
+                    print(fmt.format(r["symbol"], r["qty"], r["reserved_qty"],
+                                     _money(r["avg_cost"]), _money(r["last_price"]),
+                                     _money(Decimal(r["qty"]) * Decimal(r["last_price"])),
+                                     _money(r["unrealized_pnl"])))
+                print()
 
         _emit(rows, args.json, _positions_table)
 
