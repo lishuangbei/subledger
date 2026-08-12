@@ -308,7 +308,17 @@ def _dispatch(args, ledger, broker, router) -> int:
             "avg_cost": str(p.avg_cost), "last_price": str(p.last_price),
             "unrealized_pnl": str(p.unrealized_pnl),
         } for p in ledger.list_positions(args.sub) if p.qty != 0 or p.reserved_qty != 0]
-        _emit(rows, args.json)
+
+        def _positions_table(items):
+            fmt = "{:6s} {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>12s}"
+            print(fmt.format("sub", "symbol", "qty", "reserved",
+                             "avg_cost", "last", "uPnL"))
+            for r in items:
+                print(fmt.format(r["sub_account_id"], r["symbol"], r["qty"],
+                                 r["reserved_qty"], _money(r["avg_cost"]),
+                                 _money(r["last_price"]), _money(r["unrealized_pnl"])))
+
+        _emit(rows, args.json, _positions_table)
 
     elif args.command == "status":
         import os as _os
