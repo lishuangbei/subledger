@@ -139,7 +139,8 @@ def _orders_table(rows):
     for r in rows:
         cls = r["order_class"] + ("/" + r["leg_role"] if r["leg_role"] else "")
         print(fmt.format(r["created_at"][:19], r["sub_account_id"], r["symbol"],
-                         r["side"], r["filled_qty"] or r["qty"],
+                         r["side"],
+                         r["filled_qty"] if r["filled_qty"] not in ("0", "0E-10") else r["qty"],
                          _money(r["filled_avg_price"]),
                          r["status"], cls, r["client_order_id"]))
 
