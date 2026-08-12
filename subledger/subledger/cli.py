@@ -192,6 +192,8 @@ def run(stack, argv) -> int:
 
     p_positions = sub.add_parser("positions")
     p_positions.add_argument("--sub", default=None)
+    p_positions.add_argument("--broker", action="store_true",
+                             help="the REAL account's net positions (live broker query), with ledger aggregate for comparison")
 
     p_equity = sub.add_parser("equity")
     p_equity.add_argument("--sub", default=None)
@@ -272,6 +274,34 @@ def _dispatch(args, ledger, broker, router) -> int:
                    "unallocated_cash": str(ledger.unallocated_cash())}, args.json)
 
     elif args.command == "positions":
+        if args.broker:
+            ledger_agg = ledger.aggregate_positions()
+            rows = []
+            for p in broker.get_account().positions:
+                rows.append({
+                    "symbol": p.symbol,
+                    "broker_qty": str(p.qty),
+                    "ledger_qty": str(ledger_agg.pop(p.symbol, "0")),
+                    "avg_entry": str(p.avg_entry_price),
+                    "current": str(p.current_price),
+                    "market_value": str(p.qty * p.current_price),
+                })
+            for symbol, qty in ledger_agg.items():   # ledger-only leftovers
+                rows.append({"symbol": symbol, "broker_qty": "0",
+                             "ledger_qty": str(qty), "avg_entry": "-",
+                             "current": "-", "market_value": "-"})
+            if args.json:
+                _emit(rows, True)
+            else:
+                fmt = "{:6s} {:>10s} {:>10s} {:>12s} {:>12s} {:>14s}  {}"
+                print(fmt.format("symbol", "broker", "ledger", "avg_entry",
+                                 "current", "mkt_value", ""))
+                for r in rows:
+                    flag = "" if r["broker_qty"] == r["ledger_qty"] else "  <-- MISMATCH"
+                    print(fmt.format(r["symbol"], r["broker_qty"], r["ledger_qty"],
+                                     _money(r["avg_entry"]), _money(r["current"]),
+                                     _money(r["market_value"]), flag))
+            return 0
         rows = [{
             "sub_account_id": p.sub_account_id, "symbol": p.symbol,
             "qty": str(p.qty), "reserved_qty": str(p.reserved_qty),
