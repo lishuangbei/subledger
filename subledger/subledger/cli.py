@@ -15,10 +15,13 @@ Commands
                                           up in positions or reserved by open
                                           orders is refused)
   accounts delete <id>                   (must be flat; cash returns to pool)
-  status <ID> | status --all
-           one sub-account in depth (balances, buying power, positions,
-           open orders) — or every account plus pool, totals and the
-           latest reconciliation
+  status   app/runtime health: instance identity, booking-writer process,
+           market clock, halt flag, latest reconciliation, equity-history
+           freshness, open-order count — plus each sub-account's
+           CONFIGURATION (margin, limits, whitelist; not balances)
+  accounts show <ID>
+           one account in depth: balances, live buying power, positions,
+           open orders, settings
   positions [--sub ID] [--broker]
            ledger positions grouped by sub-account (with per-account value
            subtotals); --broker shows the REAL account's net positions with
@@ -201,9 +204,10 @@ def run(stack, argv) -> int:
     p_delete = acc_sub.add_parser("delete")
     p_delete.add_argument("id")
 
-    p_status = sub.add_parser("status")
-    p_status.add_argument("id", nargs="?", default=None)
-    p_status.add_argument("--all", dest="all_accounts", action="store_true")
+    sub.add_parser("status")
+
+    p_show = acc_sub.add_parser("show")
+    p_show.add_argument("id")
 
     p_positions = sub.add_parser("positions")
     p_positions.add_argument("--sub", default=None)
@@ -242,11 +246,17 @@ def run(stack, argv) -> int:
 def _dispatch(args, ledger, broker, router) -> int:
     if args.command == "accounts":
         if args.subcommand == "list":
+            from .models import ZERO as _Z
             rows = [_acct_dict(ledger, router, a) for a in ledger.list_sub_accounts()]
-            payload = {"accounts": rows, "unallocated_cash": str(ledger.unallocated_cash())}
+            total = sum((Decimal(r["equity"]) for r in rows), _Z) + ledger.unallocated_cash()
+            payload = {"accounts": rows,
+                       "unallocated_cash": str(ledger.unallocated_cash()),
+                       "total_equity": str(total),
+                       "halted": ledger.is_halted()}
             _emit(payload if args.json else rows, args.json, _accounts_table)
             if not args.json:
-                print("unallocated pool: {}".format(ledger.unallocated_cash()))
+                print("unallocated pool: {}   total equity: {}   halted: {}".format(
+                    _money(ledger.unallocated_cash()), _money(total), ledger.is_halted()))
         elif args.subcommand == "create":
             acct = SubAccount(
                 id=args.id,
@@ -283,6 +293,49 @@ def _dispatch(args, ledger, broker, router) -> int:
             _emit({"id": args.id, "moved": args.amount,
                    "cash": str(ledger.get_sub_account(args.id).cash),
                    "unallocated_cash": str(ledger.unallocated_cash())}, args.json)
+        elif args.subcommand == "show":
+            from . import risk as _risk
+            from .models import ZERO as _ZERO
+
+            acct = ledger.get_sub_account(args.id)
+            view = _acct_dict(ledger, router, acct)
+            gross = sum((p.market_value for p in ledger.list_positions(acct.id)), _ZERO)
+            view["buying_power"] = str(_risk.buying_power(acct, gross))
+            view["positions"] = [{
+                "symbol": p.symbol, "qty": str(p.qty),
+                "reserved_qty": str(p.reserved_qty), "avg_cost": str(p.avg_cost),
+                "last_price": str(p.last_price),
+                "unrealized_pnl": str(p.unrealized_pnl),
+            } for p in ledger.list_positions(acct.id) if p.qty != 0 or p.reserved_qty != 0]
+            view["open_orders"] = [
+                _order_dict(o) for o in ledger.list_orders(acct.id, open_only=True)]
+            if args.json:
+                _emit(view, True)
+            else:
+                money_keys = {"cash", "reserved_cash", "positions_value", "equity",
+                              "buying_power", "realized_pnl", "unrealized_pnl",
+                              "max_order_notional", "daily_loss_limit"}
+                for key in ("id", "name", "active", "cash", "reserved_cash",
+                            "positions_value", "equity", "buying_power",
+                            "realized_pnl", "unrealized_pnl", "margin_multiplier",
+                            "max_order_notional", "daily_loss_limit",
+                            "symbol_whitelist", "allow_short"):
+                    value = _money(view[key]) if key in money_keys else view[key]
+                    print("{:20s} {}".format(key, value))
+                if view["positions"]:
+                    print("\npositions:")
+                    pfmt = "  {:6s} {:>8s} {:>9s} {:>12s} {:>12s} {:>12s}"
+                    print(pfmt.format("symbol", "qty", "reserved", "avg_cost", "last", "uPnL"))
+                    for pp in view["positions"]:
+                        print(pfmt.format(pp["symbol"], pp["qty"], pp["reserved_qty"],
+                                          _money(pp["avg_cost"]), _money(pp["last_price"]),
+                                          _money(pp["unrealized_pnl"])))
+                if view["open_orders"]:
+                    print("\nopen orders:")
+                    for o in view["open_orders"]:
+                        print("  {} {} {} x{} {} {}".format(
+                            o["side"], o["symbol"], o["type"], o["qty"],
+                            o["status"], o["client_order_id"]))
         elif args.subcommand == "delete":
             returned = ledger.delete_sub_account(args.id)
             _emit({"deleted": args.id, "cash_returned_to_pool": str(returned),
@@ -352,96 +405,80 @@ def _dispatch(args, ledger, broker, router) -> int:
         from . import risk as _risk
         from .models import ZERO as _ZERO
 
-        def instance_identity() -> dict:
-            identity = {"label": _os.environ.get("SUBLEDGER_LABEL") or None,
-                        "ledger": getattr(ledger, "path", "?")}
-            identity.update(broker.describe())
-            try:
-                identity["account_id"] = broker.get_account().account_id
-            except Exception:
-                identity["account_id"] = "(broker unreachable)"
-            return identity
+        identity = {"label": _os.environ.get("SUBLEDGER_LABEL") or None,
+                    "ledger": getattr(ledger, "path", "?")}
+        identity.update(broker.describe())
+        try:
+            identity["account_id"] = broker.get_account().account_id
+        except Exception:
+            identity["account_id"] = "(broker unreachable)"
 
-        def print_identity(identity: dict) -> None:
-            print("instance: {}  broker={} {}  account={}  ledger={}".format(
-                identity.get("label") or "-", identity.get("broker"),
-                identity.get("mode", ""), str(identity.get("account_id"))[:13],
-                identity.get("ledger")))
-            print("-" * 72)
+        writer = {"running": False, "pid": None}
+        lock_path = str(getattr(ledger, "path", "")) + ".lock"
+        try:
+            pid = int(open(lock_path).read().strip())
+            _os.kill(pid, 0)
+            writer = {"running": True, "pid": pid}
+        except (OSError, ValueError):
+            pass
 
-        def account_status(acct) -> dict:
-            view = _acct_dict(ledger, router, acct)
-            gross = sum(
-                (p.market_value for p in ledger.list_positions(acct.id)), _ZERO)
-            view["buying_power"] = str(_risk.buying_power(acct, gross))
-            view["positions"] = [{
-                "symbol": p.symbol, "qty": str(p.qty),
-                "reserved_qty": str(p.reserved_qty), "avg_cost": str(p.avg_cost),
-                "last_price": str(p.last_price),
-                "unrealized_pnl": str(p.unrealized_pnl),
-            } for p in ledger.list_positions(acct.id) if p.qty != 0 or p.reserved_qty != 0]
-            view["open_orders"] = [
-                _order_dict(o) for o in ledger.list_orders(acct.id, open_only=True)]
-            return view
+        try:
+            clock = broker.get_clock()
+            market = {"is_open": clock.is_open, "next_open": clock.next_open,
+                      "next_close": clock.next_close}
+        except Exception:
+            market = {"is_open": None}
 
-        if args.all_accounts:
-            accounts = [account_status(a) for a in ledger.list_sub_accounts()]
-            payload = {
-                "instance": instance_identity(),
-                "accounts": accounts,
-                "unallocated_cash": str(ledger.unallocated_cash()),
-                "total_equity": str(sum(
-                    (Decimal(a["equity"]) for a in accounts), _ZERO)
-                    + ledger.unallocated_cash()),
-                "halted": ledger.is_halted(),
-                "latest_reconciliation": ledger.latest_reconciliation(),
-            }
-            if args.json:
-                _emit(payload, True)
-            else:
-                print_identity(payload["instance"])
-                _accounts_table(accounts)
-                print("unallocated pool: {}   total equity: {}   halted: {}".format(
-                    _money(payload["unallocated_cash"]), _money(payload["total_equity"]),
-                    payload["halted"]))
-                latest = payload["latest_reconciliation"]
-                if latest:
-                    print("latest reconciliation: ok={} at={}".format(
-                        latest.get("ok"), latest.get("at")))
-        elif args.id:
-            view = account_status(ledger.get_sub_account(args.id))
-            view["instance"] = instance_identity()
-            if args.json:
-                _emit(view, True)
-            else:
-                print_identity(view["instance"])
-                money_keys = {"cash", "reserved_cash", "positions_value", "equity",
-                              "buying_power", "realized_pnl", "unrealized_pnl",
-                              "max_order_notional", "daily_loss_limit"}
-                for key in ("id", "name", "active", "cash", "reserved_cash",
-                            "positions_value", "equity", "buying_power",
-                            "realized_pnl", "unrealized_pnl", "margin_multiplier",
-                            "max_order_notional", "daily_loss_limit",
-                            "symbol_whitelist", "allow_short"):
-                    value = _money(view[key]) if key in money_keys else view[key]
-                    print("{:20s} {}".format(key, value))
-                if view["positions"]:
-                    print("\npositions:")
-                    pfmt = "  {:6s} {:>8s} {:>9s} {:>12s} {:>12s} {:>12s}"
-                    print(pfmt.format("symbol", "qty", "reserved", "avg_cost", "last", "uPnL"))
-                    for p in view["positions"]:
-                        print(pfmt.format(
-                            p["symbol"], p["qty"], p["reserved_qty"],
-                            _money(p["avg_cost"]), _money(p["last_price"]),
-                            _money(p["unrealized_pnl"])))
-                if view["open_orders"]:
-                    print("\nopen orders:")
-                    for o in view["open_orders"]:
-                        print("  {} {} {} x{} {} {}".format(
-                            o["side"], o["symbol"], o["type"], o["qty"],
-                            o["status"], o["client_order_id"]))
+        latest_recon = ledger.latest_reconciliation()
+        eq = ledger.equity_history(limit=1)
+        configs = [{
+            "id": a.id, "name": a.name, "active": a.active,
+            "margin_multiplier": str(a.margin_multiplier),
+            "max_order_notional": None if a.max_order_notional is None else str(a.max_order_notional),
+            "daily_loss_limit": None if a.daily_loss_limit is None else str(a.daily_loss_limit),
+            "whitelist_size": None if a.symbol_whitelist is None else len(a.symbol_whitelist),
+            "allow_short": a.allow_short,
+        } for a in ledger.list_sub_accounts()]
+        payload = {
+            "instance": identity,
+            "writer": writer,
+            "market": market,
+            "halted": ledger.is_halted(),
+            "open_orders": len(ledger.list_orders(open_only=True)),
+            "latest_reconciliation": None if latest_recon is None else {
+                "ok": latest_recon.get("ok"), "at": latest_recon.get("at")},
+            "latest_equity_snapshot_at": eq[0]["at"] if eq else None,
+            "accounts_config": configs,
+        }
+        if args.json:
+            _emit(payload, True)
         else:
-            raise ValueError("status needs a sub-account id or --all")
+            print("instance: {}  broker={} {}  account={}".format(
+                identity.get("label") or "-", identity.get("broker"),
+                identity.get("mode", ""), str(identity.get("account_id"))[:13]))
+            print("ledger:   {}".format(identity.get("ledger")))
+            print("writer:   {}".format(
+                "RUNNING (pid {})".format(writer["pid"]) if writer["running"]
+                else "NOT RUNNING — no booking process holds the ledger"))
+            print("market:   {}".format(
+                "OPEN" if market.get("is_open") else "closed (next open {})".format(
+                    market.get("next_open", "?")) if market.get("is_open") is not None
+                else "unknown (broker unreachable)"))
+            print("halted:   {}    open orders: {}".format(payload["halted"], payload["open_orders"]))
+            lr = payload["latest_reconciliation"]
+            print("reconcile: {}".format(
+                "ok={} at={}".format(lr["ok"], lr["at"]) if lr else "never ran"))
+            print("equity history: last row {}".format(payload["latest_equity_snapshot_at"] or "none"))
+            print()
+            fmt = "{:6s} {:6s} {:>5s} {:>14s} {:>12s} {:>9s} {:>6s}  {}"
+            print(fmt.format("id", "active", "mult", "max_notional",
+                             "loss_limit", "whitelist", "short", "name"))
+            for c in configs:
+                print(fmt.format(
+                    c["id"], str(c["active"]), c["margin_multiplier"],
+                    _money(c["max_order_notional"]), _money(c["daily_loss_limit"]),
+                    "-" if c["whitelist_size"] is None else str(c["whitelist_size"]),
+                    str(c["allow_short"]), c["name"]))
 
     elif args.command == "equity":
         rows = ledger.equity_history(args.sub, since=args.since, limit=args.limit)

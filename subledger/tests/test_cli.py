@@ -228,7 +228,7 @@ class StatusCommandTests(unittest.TestCase):
         self.router.place_order(OrderRequest("alpha", "AAPL", OrderSide.BUY, D("50")))
 
     def test_single_account_status(self):
-        code, out = invoke(self.stack, "--json", "status", "alpha")
+        code, out = invoke(self.stack, "--json", "accounts", "show", "alpha")
         self.assertEqual(code, 0)
         view = json.loads(out)
         self.assertEqual(view["equity"], "30000")
@@ -237,21 +237,24 @@ class StatusCommandTests(unittest.TestCase):
         self.assertEqual(view["positions"][0]["symbol"], "AAPL")
         self.assertEqual(view["open_orders"], [])
 
-    def test_all_accounts_status(self):
-        code, out = invoke(self.stack, "--json", "status", "--all")
+    def test_accounts_list_totals(self):
+        code, out = invoke(self.stack, "--json", "accounts", "list")
         payload = json.loads(out)
         self.assertEqual(len(payload["accounts"]), 1)
         self.assertEqual(payload["unallocated_cash"], "70000")
         self.assertEqual(payload["total_equity"], "100000")
         self.assertFalse(payload["halted"])
 
-    def test_status_without_target_errors(self):
+    def test_status_is_app_health(self):
         code, out = invoke(self.stack, "--json", "status")
-        self.assertEqual(code, 1)
-        self.assertIn("--all", json.loads(out)["error"])
+        payload = json.loads(out)
+        self.assertIn("writer", payload)
+        self.assertIn("accounts_config", payload)
+        self.assertEqual(payload["accounts_config"][0]["id"], "alpha")
+        self.assertNotIn("cash", payload["accounts_config"][0])  # config, not balances
 
     def test_status_shows_instance_identity(self):
-        code, out = invoke(self.stack, "--json", "status", "--all")
+        code, out = invoke(self.stack, "--json", "status")
         identity = json.loads(out)["instance"]
         self.assertEqual(identity["broker"], "mock")
         self.assertEqual(identity["mode"], "sim")
