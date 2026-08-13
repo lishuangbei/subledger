@@ -83,8 +83,17 @@ class Router:
         self.broker = broker
         self.eager_sync = eager_sync
         self._lock = threading.RLock()
+        self._pending_verification: Optional[str] = None
         if expected_account_id:
-            self.verify_account(expected_account_id)
+            try:
+                self.verify_account(expected_account_id)
+            except BrokerError as exc:
+                # Broker unreachable at construction (outage) is NOT a
+                # mismatch: boot anyway, but fail closed — every order is
+                # blocked until verification succeeds on a later attempt.
+                self._pending_verification = expected_account_id
+                logger.warning("account verification deferred (broker "
+                               "unreachable): %s — orders blocked until verified", exc)
 
     def verify_account(self, expected_account_id: str) -> str:
         actual = self.broker.get_account().account_id
@@ -94,6 +103,7 @@ class Router:
                 "wrong credentials? refusing to route orders".format(
                     actual[:8], expected_account_id[:8]))
         logger.info("account verified: %s…", actual[:8])
+        self._pending_verification = None
         return actual
 
     # -- account management --------------------------------------------
@@ -140,6 +150,13 @@ class Router:
 
         t0 = _time.perf_counter()
         with self._lock:
+            if self._pending_verification:
+                try:
+                    self.verify_account(self._pending_verification)
+                except BrokerError as exc:
+                    raise OrderRejected(
+                        "account not yet verified (broker unreachable): {}".format(exc)
+                    ) from exc
             acct = self.ledger.get_sub_account(req.sub_account_id)
             pos = self.ledger.get_position(req.sub_account_id, req.symbol)
 

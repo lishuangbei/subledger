@@ -279,3 +279,50 @@ class WriterLockTests(unittest.TestCase):
         from subledger.ledger import Ledger as L
         a, b = L(":memory:"), L(":memory:")
         self.assertIsNotNone(a); self.assertIsNotNone(b)
+
+
+class ResilientVerificationTests(unittest.TestCase):
+    def test_outage_defers_then_blocks_orders_until_verified(self):
+        from subledger import Ledger, Router
+        from subledger.broker.base import BrokerError
+        from subledger.router import OrderRejected
+
+        class FlakyBroker(MockBroker):
+            fail_times = 1
+            def get_account(self):
+                if self.fail_times > 0:
+                    self.fail_times -= 1
+                    raise BrokerError("simulated outage")
+                return super().get_account()
+
+        broker = FlakyBroker(cash=D("1000"))
+        router = Router(Ledger(":memory:"), broker,
+                        expected_account_id="mock-account-1")   # 构造时故障→降级待定
+        router.adopt_broker_cash()
+        broker.set_price("AAPL", D("10"))
+        router.create_sub_account(SubAccount(id="a"), initial_allocation=D("500"))
+        # 现在券商恢复:首单前补验通过
+        order = router.place_order(OrderRequest("a", "AAPL", OrderSide.BUY, D("1")))
+        self.assertEqual(order.status.value, "filled")
+
+    def test_outage_then_mismatch_still_fatal(self):
+        from subledger import Ledger, Router
+        from subledger.broker.base import BrokerError
+        from subledger.router import AccountMismatch, OrderRejected
+
+        class FlakyWrong(MockBroker):
+            failed = False
+            def get_account(self):
+                if not self.failed:
+                    self.failed = True
+                    raise BrokerError("outage")
+                state = super().get_account()
+                return state
+        broker = FlakyWrong(cash=D("1000"))
+        broker.account_id = "someone-else"
+        router = Router(Ledger(":memory:"), broker, expected_account_id="mock-account-1")
+        broker2_cash = router.adopt_broker_cash()
+        router.create_sub_account(SubAccount(id="a"), initial_allocation=D("500"))
+        broker.set_price("AAPL", D("10"))
+        with self.assertRaises(AccountMismatch):
+            router.place_order(OrderRequest("a", "AAPL", OrderSide.BUY, D("1")))

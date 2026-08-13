@@ -35,6 +35,30 @@ from .base import (
 _TRANSIENT_MARKERS = ("429", "500", "502", "503", "504", "timed out", "timeout",
                       "Connection", "connection", "Temporary")
 
+REQUEST_TIMEOUT_S = 15
+
+
+def _install_timeout(client, seconds: float = REQUEST_TIMEOUT_S) -> None:
+    """alpaca-py issues REST calls with NO timeout — a stalled broker
+    connection blocks the caller forever (observed during the 2026-08-13
+    Alpaca degradation: SSL_read hung indefinitely). Inject a default
+    timeout into the underlying requests.Session; the websocket stream is a
+    separate client and is unaffected."""
+    import functools
+
+    session = getattr(client, "_session", None)
+    if session is None or getattr(session.request, "__wrapped_timeout__", False):
+        return
+    original = session.request
+
+    @functools.wraps(original)
+    def with_timeout(*args, **kwargs):
+        kwargs.setdefault("timeout", seconds)
+        return original(*args, **kwargs)
+
+    with_timeout.__wrapped_timeout__ = True
+    session.request = with_timeout
+
 # Alpaca order statuses -> our normalized statuses.
 _STATUS_MAP = {
     "new": "open",
@@ -67,6 +91,7 @@ class AlpacaBroker(BrokerAdapter):
         except ImportError as exc:  # pragma: no cover
             raise BrokerError("alpaca-py is not installed: pip install alpaca-py") from exc
         self._client = TradingClient(api_key, secret_key, paper=paper)
+        _install_timeout(self._client)
         self._api_key = api_key
         self._secret_key = secret_key
         self._paper = paper
