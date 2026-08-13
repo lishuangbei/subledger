@@ -300,6 +300,19 @@ def create_app(stack=None, background_loops: bool = True):
             raise HTTPException(404, "no reconciliation has run yet")
         return latest
 
+    @app.get("/clock")
+    def clock():
+        c = broker.get_clock()
+        return {"is_open": c.is_open, "next_open": c.next_open, "next_close": c.next_close}
+
+    @app.get("/marks")
+    def marks(symbols: str):
+        wanted = [s.strip().upper() for s in symbols.split(",") if s.strip()]
+        if not wanted:
+            raise HTTPException(422, "symbols must be a non-empty comma-separated list")
+        prices = broker.last_prices(wanted)
+        return {s: str(prices[s]) for s in wanted if s in prices}
+
     @app.post("/halt")
     def halt():
         router.halt()
@@ -325,6 +338,7 @@ def create_app(stack=None, background_loops: bool = True):
     def _order_view(o) -> dict:
         return {
             "id": o.id,
+            "client_order_id": o.client_order_id,
             "sub_account_id": o.sub_account_id,
             "symbol": o.symbol,
             "side": o.side.value,

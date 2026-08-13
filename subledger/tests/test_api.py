@@ -54,6 +54,27 @@ class RestWritePathTests(unittest.TestCase):
         r = self.client.post("/accounts/t1/allocate", json={"amount": "-1000"})
         self.assertEqual(r.status_code, 200, r.text)
 
+    def test_clock_and_marks_read_through(self):
+        r = self.client.get("/clock")
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertIn("is_open", r.json())
+
+        self.broker.set_price("MSFT", D("500.5"))
+        r = self.client.get("/marks", params={"symbols": "aapl, MSFT,NOPE"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json(), {"AAPL": "100", "MSFT": "500.5"})  # unknown omitted
+
+        r = self.client.get("/marks", params={"symbols": " , "})
+        self.assertEqual(r.status_code, 422)
+
+    def test_order_view_exposes_client_order_id(self):
+        self.client.post("/accounts", json={"id": "t3", "allocation": "20000"})
+        r = self.client.post("/orders", json={
+            "sub_account_id": "t3", "symbol": "AAPL", "side": "buy", "qty": "1",
+            "client_tag": "idem-check"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["client_order_id"], "sl.t3.idem-check")
+
     def test_business_rejection_is_422_with_string_detail(self):
         self.client.post("/accounts", json={"id": "t2", "allocation": "10"})
         r = self.client.post("/orders", json={
