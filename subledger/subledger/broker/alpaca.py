@@ -98,6 +98,7 @@ class AlpacaBroker(BrokerAdapter):
         self._retries = retries
         self._retry_base_delay = retry_base_delay
         self._asset_cache: Dict[str, BrokerAsset] = {}
+        self._sip_entitled: Optional[bool] = None  # unknown until first lookup
 
     def _call(self, label: str, fn, *args, **kwargs):
         """Call an alpaca-py client method with backoff on transient errors
@@ -294,33 +295,45 @@ class AlpacaBroker(BrokerAdapter):
         return self._data_client
 
     def last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
-        """Batch latest-trade marks for arbitrary symbols (one call, feed
-        fallback). The base-class default only knows held positions, which
-        starves order sizing for new entries."""
+        """Batch latest-trade marks for arbitrary symbols (one call per feed,
+        progressive fill). Real-time consolidated SIP first — sizing decides
+        buying power, and a 15-minute-stale print can misjudge it by the full
+        move since then. Keys without the SIP subscription fall back to
+        real-time-but-thin IEX, then delayed SIP, then held positions."""
         wanted = [s for s in symbols if s]
         if not wanted:
             return {}
+        marks: Dict[str, Decimal] = {}
         try:
             from alpaca.data.enums import DataFeed
             from alpaca.data.requests import StockLatestTradeRequest
 
-            marks: Dict[str, Decimal] = {}
-            for feed in (DataFeed.DELAYED_SIP, DataFeed.IEX):
+            for feed in (DataFeed.SIP, DataFeed.IEX, DataFeed.DELAYED_SIP):
+                if feed is DataFeed.SIP and self._sip_entitled is False:
+                    continue
+                missing = [s for s in wanted if s not in marks]
+                if not missing:
+                    break
                 try:
                     trades = self._data.get_stock_latest_trade(
-                        StockLatestTradeRequest(symbol_or_symbols=wanted, feed=feed)
+                        StockLatestTradeRequest(symbol_or_symbols=missing, feed=feed)
                     )
-                except Exception:
+                    if feed is DataFeed.SIP:
+                        self._sip_entitled = True
+                except Exception as exc:
+                    if feed is DataFeed.SIP and "subscription" in str(exc).lower():
+                        self._sip_entitled = False  # remember; outages stay retryable
                     continue
-                for symbol in wanted:
+                for symbol in missing:
                     price = getattr(trades.get(symbol), "price", None)
                     if price and float(price) > 0:
                         marks[symbol] = Decimal(str(price))
-                if marks:
-                    return marks
         except Exception:  # data API unavailable: fall through to positions
             pass
-        return super().last_prices(wanted)
+        if len(marks) < len(wanted):
+            for symbol, price in super().last_prices(wanted).items():
+                marks.setdefault(symbol, price)
+        return marks
 
     def get_clock(self) -> BrokerClock:
         clock = self._call("get_clock", self._client.get_clock)
