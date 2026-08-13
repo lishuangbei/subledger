@@ -282,6 +282,46 @@ class AlpacaBroker(BrokerAdapter):
                 break
         return out
 
+    @property
+    def _data(self):
+        """Lazy market-data client (same keys). Only touched by last_prices,
+        so trading-only deployments never import the data stack."""
+        if getattr(self, "_data_client", None) is None:
+            from alpaca.data.historical import StockHistoricalDataClient
+
+            self._data_client = StockHistoricalDataClient(self._api_key, self._secret_key)
+            _install_timeout(self._data_client)
+        return self._data_client
+
+    def last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
+        """Batch latest-trade marks for arbitrary symbols (one call, feed
+        fallback). The base-class default only knows held positions, which
+        starves order sizing for new entries."""
+        wanted = [s for s in symbols if s]
+        if not wanted:
+            return {}
+        try:
+            from alpaca.data.enums import DataFeed
+            from alpaca.data.requests import StockLatestTradeRequest
+
+            marks: Dict[str, Decimal] = {}
+            for feed in (DataFeed.DELAYED_SIP, DataFeed.IEX):
+                try:
+                    trades = self._data.get_stock_latest_trade(
+                        StockLatestTradeRequest(symbol_or_symbols=wanted, feed=feed)
+                    )
+                except Exception:
+                    continue
+                for symbol in wanted:
+                    price = getattr(trades.get(symbol), "price", None)
+                    if price and float(price) > 0:
+                        marks[symbol] = Decimal(str(price))
+                if marks:
+                    return marks
+        except Exception:  # data API unavailable: fall through to positions
+            pass
+        return super().last_prices(wanted)
+
     def get_clock(self) -> BrokerClock:
         clock = self._call("get_clock", self._client.get_clock)
         return BrokerClock(

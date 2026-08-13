@@ -103,6 +103,8 @@ curl -X POST :8000/accounts -d '{"id":"momo","allocation":"30000"}'
 curl -X POST :8000/orders   -d '{"sub_account_id":"momo","symbol":"AAPL","side":"buy","qty":"10"}'
 curl :8000/accounts/momo              # cash / equity / realized / unrealized
 curl :8000/reconcile/latest
+curl :8000/clock                      # is_open / next_open / next_close
+curl ":8000/marks?symbols=AAPL,MSFT"  # batch marks, keys stay server-side
 curl -X POST :8000/halt               # kill switch
 ```
 
