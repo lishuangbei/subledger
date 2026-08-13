@@ -16,8 +16,12 @@ class AlpacaLastPricesTests(unittest.TestCase):
 
     def setUp(self):
         from subledger.broker.alpaca import AlpacaBroker
+        from subledger.broker.base import BrokerAccountState
 
         self.broker = AlpacaBroker("key-id", "secret", paper=True)
+        # keep the position-derived last resort off the network
+        self.broker.get_account = lambda: BrokerAccountState(
+            cash=D("0"), equity=D("0"), positions=[])
 
     class _FakeDataClient:
         def __init__(self, trades):
