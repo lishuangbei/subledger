@@ -233,13 +233,18 @@ class AlpacaBroker(BrokerAdapter):
         qty: Optional[Decimal] = None,
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
     ) -> str:
+        """Alpaca replace = atomic cancel + NEW order. Without an explicit
+        client_order_id the replacement gets a broker-generated UUID and our
+        attribution loses the name (the REGN incident) — always pass one."""
         from alpaca.trading.requests import ReplaceOrderRequest
 
         request = ReplaceOrderRequest(
             qty=None if qty is None else int(qty),
             limit_price=None if limit_price is None else float(limit_price),
             stop_price=None if stop_price is None else float(stop_price),
+            client_order_id=client_order_id,
         )
         order = self._call("replace", self._client.replace_order_by_id,
                            broker_order_id, order_data=request)

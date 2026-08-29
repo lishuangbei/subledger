@@ -114,6 +114,7 @@ class BrokerAdapter(abc.ABC):
         qty: Optional[Decimal] = None,
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
     ) -> str:
         """Replace price/qty of a live order; returns the (possibly new)
         broker order id. Venues without replace support raise BrokerError."""

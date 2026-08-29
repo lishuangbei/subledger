@@ -48,6 +48,16 @@ from .models import (
 
 logger = logging.getLogger("subledger.router")
 
+
+def _replacement_client_id(original: str) -> str:
+    """Broker-side name for a replacement order. Alpaca's replace creates a
+    NEW order; without an explicit client id it gets a random UUID and fills
+    arrive under a name nobody recognizes. Derive an audit-continuous, unique
+    name from the original tag."""
+    import uuid as _uuid
+
+    return "{}-r{}".format(original, _uuid.uuid4().hex[:6])[:128]
+
 _BROKER_TO_LOCAL = {
     "open": OrderStatus.OPEN,
     "partially_filled": OrderStatus.PARTIALLY_FILLED,
@@ -287,7 +297,8 @@ class Router:
                 if limit_price is None and stop_price is None:
                     raise OrderRejected("nothing to replace")
                 new_broker_id = self.broker.replace_order(
-                    order.broker_order_id, limit_price=limit_price, stop_price=stop_price
+                    order.broker_order_id, limit_price=limit_price, stop_price=stop_price,
+                    client_order_id=_replacement_client_id(order.client_order_id),
                 )
                 if limit_price is not None:
                     order.limit_price = limit_price
@@ -328,7 +339,8 @@ class Router:
                     raise OrderRejected("insufficient sellable shares for replacement")
 
             new_broker_id = self.broker.replace_order(
-                order.broker_order_id, qty=qty, limit_price=limit_price, stop_price=stop_price
+                order.broker_order_id, qty=qty, limit_price=limit_price, stop_price=stop_price,
+                client_order_id=_replacement_client_id(order.client_order_id),
             )
 
             if order.side == OrderSide.BUY:
@@ -367,8 +379,22 @@ class Router:
             order = None
             if state.client_order_id:
                 order = self.ledger.get_order_by_client_id(state.client_order_id)
+            if (order is not None and state.broker_order_id
+                    and order.broker_order_id
+                    and order.broker_order_id != state.broker_order_id):
+                # The record has been re-pointed to a replacement; this event
+                # belongs to a superseded incarnation (e.g. the old order's
+                # "replaced" cancel). Booking it would clobber the live one —
+                # the REGN incident. Ignore.
+                logger.info("ignoring stale-incarnation event for %s (event broker id %s, "
+                            "current %s)", order.id, state.broker_order_id,
+                            order.broker_order_id)
+                return False
             if order is None and state.broker_order_id:
-                for candidate in self.ledger.list_orders(open_only=True):
+                # Broker-id fallback must see ALL orders: a replacement's fill
+                # arrives under a client id we may not know, and the row could
+                # have been wrongly terminal-ized moments earlier.
+                for candidate in self.ledger.list_orders():
                     if candidate.broker_order_id == state.broker_order_id:
                         order = candidate
                         break

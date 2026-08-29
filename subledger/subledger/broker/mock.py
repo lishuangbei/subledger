@@ -194,6 +194,7 @@ class MockBroker(BrokerAdapter):
         qty: Optional[Decimal] = None,
         limit_price: Optional[Decimal] = None,
         stop_price: Optional[Decimal] = None,
+        client_order_id: Optional[str] = None,
     ) -> str:
         old = self.orders.get(broker_order_id)
         if old is None:
@@ -203,6 +204,8 @@ class MockBroker(BrokerAdapter):
         new_id = "mock-{}".format(next(self._seq))
         new = dict(old)
         new["id"] = new_id
+        if client_order_id:
+            new["client_order_id"] = client_order_id
         if qty is not None:
             new["qty"] = qty
         if limit_price is not None:
