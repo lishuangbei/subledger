@@ -110,6 +110,19 @@ def validate_structure(req: OrderRequest) -> None:
             raise RiskViolation("{} stop_price must be positive".format(label))
 
 
+def _validate_whole_shares(pos: Position, req: OrderRequest) -> None:
+    """qty must be a whole number (policy, 2026-08-31). Single exception:
+    SELLING an entire existing position — legacy fractional remainders
+    (notional-parked sleeves) must stay closeable."""
+    if req.qty <= ZERO or req.qty == req.qty.to_integral_value():
+        return
+    if req.side == OrderSide.SELL and req.qty == pos.qty:
+        return   # full close-out of a fractional remainder
+    raise RiskViolation(
+        "fractional qty {} not allowed (whole shares only; exception: "
+        "selling an entire position)".format(req.qty))
+
+
 def check_order(
     acct: SubAccount,
     pos: Position,
@@ -130,6 +143,7 @@ def check_order(
         raise RiskViolation("sub-account {} is disabled".format(acct.id))
 
     validate_structure(req)
+    _validate_whole_shares(pos, req)
 
     if acct.symbol_whitelist is not None and req.symbol not in acct.symbol_whitelist:
         raise RiskViolation(
