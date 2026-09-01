@@ -651,9 +651,23 @@ def _dispatch(args, ledger, broker, router) -> int:
     return 0
 
 
+_VIEW_COMMANDS = {"status", "positions", "equity", "returns", "history", "orders"}
+
+
 def _build_stack_from_env():
     from .api import _build_stack
 
+    # Pure view commands open the ledger as a non-exclusive reader so they
+    # work while a daemon holds the writer lock. Anything that can write
+    # (accounts create/update/allocate/delete) keeps the exclusive-writer
+    # path — LedgerLocked while a daemon runs is the guard, not a bug.
+    import os
+
+    words = [a for a in sys.argv[1:] if not a.startswith("-")]
+    cmd = words[0] if words else ""
+    sub = words[1] if len(words) > 1 else ""
+    if cmd in _VIEW_COMMANDS or (cmd == "accounts" and sub in ("list", "show")):
+        os.environ.setdefault("SUBLEDGER_READONLY", "1")
     return _build_stack()
 
 

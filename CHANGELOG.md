@@ -1,5 +1,16 @@
 # Changelog
 
+## unreleased — 2026-08-31
+
+- REST `_order_view` 增加 `time_in_force` 字段(账本本就存储,此前未序列化)。
+  背景:liveAlpa 实例接入 hermes live4731 执行器时,其 OCO 保护判定要求
+  读到 `time_in_force == "gtc"`。106 测试通过;对现有消费者为纯增量
+- CLI 纯视图命令(status/positions/equity/returns/history/orders、
+  accounts list/show)自动以非排他读者打开账本(`SUBLEDGER_READONLY=1`),
+  daemon 持写锁时视图不再 LedgerLocked;动资金命令保持排他写者路径
+  (锁挡住即护栏)。背景:liveAlpa 起 daemon 后 vendor CLI 视图全挂
+  ——trial 有 trial.cli 绕过,首个"vendor CLI + 常驻 daemon"组合暴露此缺口
+
 ## v0.4.2 — 2026-08-10
 
 硬性单写者。

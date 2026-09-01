@@ -89,7 +89,9 @@ if _HAVE_PYDANTIC:
 
 def _build_stack():
     """Assemble ledger/broker/router from environment variables."""
-    ledger = Ledger(os.environ.get("SUBLEDGER_DB", "subledger.db"))
+    readonly = os.environ.get("SUBLEDGER_READONLY", "").lower() in ("1", "true", "yes")
+    ledger = Ledger(os.environ.get("SUBLEDGER_DB", "subledger.db"),
+                    exclusive_writer=not readonly)
     broker_kind = os.environ.get("SUBLEDGER_BROKER", "mock")
     if broker_kind == "alpaca":
         from .broker.alpaca import AlpacaBroker
@@ -345,6 +347,7 @@ def create_app(stack=None, background_loops: bool = True):
             "qty": str(o.qty),
             "notional": None if o.notional is None else str(o.notional),
             "type": o.order_type.value,
+            "time_in_force": o.time_in_force.value,
             "order_class": o.order_class.value,
             "limit_price": None if o.limit_price is None else str(o.limit_price),
             "stop_price": None if o.stop_price is None else str(o.stop_price),
