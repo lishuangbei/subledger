@@ -393,19 +393,32 @@ def _dispatch(args, ledger, broker, router) -> int:
             for r in items:
                 groups.setdefault(r["sub_account_id"], []).append(r)
             fmt = "  {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>13s} {:>13s}"
-            for sub_id, rows_ in groups.items():
+            accounts = [a for a in ledger.list_sub_accounts()
+                        if args.sub in (None, a.id)]
+            known = {a.id for a in accounts}
+            # cash is part of the picture: every (filtered) account shows,
+            # including cash-only ones with zero positions
+            for acct in accounts:
+                rows_ = groups.get(acct.id, [])
                 value = sum(Decimal(r["qty"]) * Decimal(r["last_price"]) for r in rows_)
                 upnl = sum(Decimal(r["unrealized_pnl"]) for r in rows_)
-                print("[{}]  {} 仓位  市值 {}  浮盈 {}".format(
-                    sub_id, len(rows_), _money(value), _money(upnl)))
-                print(fmt.format("symbol", "qty", "reserved",
-                                 "avg_cost", "last", "mkt_value", "uPnL"))
+                print("[{}]  {} 仓位  市值 {}  现金 {}  合计 {}  浮盈 {}".format(
+                    acct.id, len(rows_), _money(value), _money(acct.cash),
+                    _money(value + acct.cash), _money(upnl)))
+                if rows_:
+                    print(fmt.format("symbol", "qty", "reserved",
+                                     "avg_cost", "last", "mkt_value", "uPnL"))
                 for r in rows_:
                     print(fmt.format(r["symbol"], r["qty"], r["reserved_qty"],
                                      _money(r["avg_cost"]), _money(r["last_price"]),
                                      _money(Decimal(r["qty"]) * Decimal(r["last_price"])),
                                      _money(r["unrealized_pnl"])))
                 print()
+            for sub_id, rows_ in groups.items():   # rows for unknown accounts
+                if sub_id not in known:
+                    print("[{}]  (账户元数据缺失) {} 仓位".format(sub_id, len(rows_)))
+            if args.sub is None:
+                print("未分配池现金: {}".format(_money(ledger.unallocated_cash())))
 
         _emit(rows, args.json, _positions_table)
 

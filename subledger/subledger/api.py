@@ -139,6 +139,9 @@ def create_app(stack=None, background_loops: bool = True):
                 router.sync()
                 now = time.monotonic()
                 if now - last_reconcile >= reconcile_interval:
+                    # Book dividends/fees first or every sell's SEC/TAF fee
+                    # shows up as cash drift (and halts when halt_on_drift).
+                    reconciler.attribute_cash_activities()
                     reconciler.run()
                     last_reconcile = now
             except Exception:  # keep the loop alive; errors are logged upstream
