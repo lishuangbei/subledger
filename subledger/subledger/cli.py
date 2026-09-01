@@ -627,9 +627,16 @@ def _dispatch(args, ledger, broker, router) -> int:
                 base_eq = Decimal(base["equity"])
                 gain = pnl(latest) - pnl(base)
                 ret = (gain / base_eq * 100) if base_eq else Decimal("0")
+                # Cash flow inside the window: equity moves that P&L does not
+                # explain (allocations, dividends, manual repairs). Any flow
+                # distorts the percentage's denominator -> not reliable.
+                net_flow = (Decimal(latest["equity"]) - base_eq) - gain
+                reliable = (not clipped) and abs(net_flow) < Decimal("1")
                 out["windows"].append({
                     "window": name, "clipped": clipped,
                     "gain": str(gain), "return_pct": str(ret.quantize(Decimal("0.01"))),
+                    "net_flow": str(net_flow.quantize(Decimal("0.01"))),
+                    "reliable": reliable,
                     "base_at": base["at"][:16],
                 })
             return out
@@ -640,13 +647,23 @@ def _dispatch(args, ledger, broker, router) -> int:
             _emit(reports, True)
         else:
             names = [w[0] for w in windows]
+            colour = _returns_colour_enabled()
             head = "{:6s} {:>14s} " + " ".join(["{:>10s}"] * len(names))
             print(head.format("id", "equity", *names))
             for r in reports:
-                cells = ["{}%{}".format(w["return_pct"], "*" if w["clipped"] else "")
-                         for w in r["windows"]]
+                cells = []
+                for w in r["windows"]:
+                    txt = "{:>9s}%".format(w["return_pct"])
+                    if colour:
+                        cells.append(_paint_return(txt, w["window"],
+                                                   Decimal(w["return_pct"]), w["reliable"]))
+                    else:
+                        cells.append(txt + ("" if w["reliable"] else "?"))
                 print(head.format(r["sub_account_id"], _money(r["equity"]), *cells))
-            print("(* = 窗口早于数据起点,按起点计算;涨幅=ΔP&L/期初净值,资金划拨免疫)")
+            if colour:
+                print(_returns_legend())
+            else:
+                print("(? = 不可信:窗口内有资金变动或持有期短于窗口;涨幅=ΔP&L/期初净值)")
 
     elif args.command in ("history", "orders"):
         orders = ledger.list_orders(
@@ -662,6 +679,54 @@ def _dispatch(args, ledger, broker, router) -> int:
         _emit(rows, args.json, _orders_table)
 
     return 0
+
+
+# Returns colouring: green/red by sign, intensity by magnitude on a PER-WINDOW
+# scale (1% in a day is news; 1% over a year is noise). White background marks
+# a percentage that cannot be trusted — cash moved inside the window or the
+# account is younger than the window. Thresholds are |return| in percent.
+_RETURN_SCALE = {
+    "today": (0.3, 0.8, 1.5, 3.0),
+    "1W":    (0.8, 2.0, 4.0, 8.0),
+    "1M":    (1.5, 4.0, 8.0, 15.0),
+    "6M":    (4.0, 10.0, 20.0, 35.0),
+    "YTD":   (5.0, 12.0, 25.0, 45.0),
+    "1Y":    (6.0, 15.0, 30.0, 55.0),
+}
+_GREENS = (22, 28, 34, 40, 46)     # ANSI-256 backgrounds, dark -> bright
+_REDS = (52, 88, 124, 160, 196)
+
+
+def _returns_colour_enabled() -> bool:
+    import os as _os
+    if _os.environ.get("NO_COLOR"):
+        return False
+    return sys.stdout.isatty() or _os.environ.get("SUBLEDGER_COLOR") == "1"
+
+
+def _paint_return(text: str, window: str, pct, reliable: bool) -> str:
+    if not reliable:
+        return "\033[48;5;231m\033[38;5;232m{}\033[0m".format(text)   # white bg
+    thresholds = _RETURN_SCALE.get(window, _RETURN_SCALE["1M"])
+    level = sum(1 for t in thresholds if abs(pct) >= t)               # 0..4
+    if level == 0 and pct == 0:
+        return text
+    palette = _GREENS if pct > 0 else _REDS
+    fg = 15 if level >= 2 or pct < 0 else 0
+    return "\033[48;5;{}m\033[38;5;{}m{}\033[0m".format(palette[level], fg, text)
+
+
+def _returns_legend() -> str:
+    def band(name):
+        t = _RETURN_SCALE[name]
+        return "{}:{}/{}/{}/{}%".format(name, *t)
+    swatches = " ".join(
+        "\033[48;5;{}m  \033[0m".format(c) for c in reversed(_REDS)) + " 0 " + " ".join(
+        "\033[48;5;{}m  \033[0m".format(c) for c in _GREENS)
+    return ("{}  深浅阈值 → {}\n"
+            "\033[48;5;231m\033[38;5;232m 白底 \033[0m = 不可信(窗口内有资金变动 / 持有期短于窗口);"
+            "涨幅=ΔP&L/期初净值").format(
+        swatches, "  ".join(band(n) for n in ("today", "1W", "1M", "6M", "YTD", "1Y")))
 
 
 _VIEW_COMMANDS = {"status", "positions", "equity", "returns", "history", "orders"}
