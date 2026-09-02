@@ -653,12 +653,13 @@ def _dispatch(args, ledger, broker, router) -> int:
             for r in reports:
                 cells = []
                 for w in r["windows"]:
-                    txt = "{:>9s}%".format(w["return_pct"])
+                    body = w["return_pct"] + "%"
+                    pad = " " * max(0, 10 - len(body))
                     if colour:
-                        cells.append(_paint_return(txt, w["window"],
-                                                   Decimal(w["return_pct"]), w["reliable"]))
+                        cells.append(pad + _paint_return(
+                            body, w["window"], Decimal(w["return_pct"]), w["reliable"]))
                     else:
-                        cells.append(txt + ("" if w["reliable"] else "?"))
+                        cells.append(pad + body + ("" if w["reliable"] else "?"))
                 print(head.format(r["sub_account_id"], _money(r["equity"]), *cells))
             if colour:
                 print(_returns_legend())
