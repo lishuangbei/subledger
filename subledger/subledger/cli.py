@@ -717,16 +717,10 @@ def _paint_return(text: str, window: str, pct, reliable: bool) -> str:
 
 
 def _returns_legend() -> str:
-    def band(name):
-        t = _RETURN_SCALE[name]
-        return "{}:{}/{}/{}/{}%".format(name, *t)
     swatches = " ".join(
         "\033[48;5;{}m  \033[0m".format(c) for c in reversed(_REDS)) + " 0 " + " ".join(
         "\033[48;5;{}m  \033[0m".format(c) for c in _GREENS)
-    return ("{}  深浅阈值 → {}\n"
-            "\033[48;5;231m\033[38;5;232m 白底 \033[0m = 不可信(窗口内有资金变动 / 持有期短于窗口);"
-            "涨幅=ΔP&L/期初净值").format(
-        swatches, "  ".join(band(n) for n in ("today", "1W", "1M", "6M", "YTD", "1Y")))
+    return "{}   \033[48;5;231m\033[38;5;232m 白底 \033[0m = 不可信(窗口内有资金变动/持有期短于窗口)".format(swatches)
 
 
 _VIEW_COMMANDS = {"status", "positions", "equity", "returns", "history", "orders"}
