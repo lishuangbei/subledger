@@ -83,6 +83,8 @@ def _acct_dict(ledger: Ledger, router: Router, acct: SubAccount) -> dict:
         "daily_loss_limit": None if acct.daily_loss_limit is None else str(acct.daily_loss_limit),
         "symbol_whitelist": acct.symbol_whitelist,
         "allow_short": acct.allow_short,
+        "cash_call": str(acct.cash_call),
+        "cash_call_deadline": acct.cash_call_deadline,
     }
 
 
@@ -309,8 +311,9 @@ def _dispatch(args, ledger, broker, router) -> int:
             _emit(_acct_dict(ledger, router, updated), args.json)
         elif args.subcommand == "cashcall":
             result = _issue_cash_call(ledger, router, args)
-            _emit(result, args.json)
-            if not args.json:
+            if args.json:
+                _emit(result, True)
+            else:
                 print("cash call #{}: moved now {}  outstanding {}  deadline {}".format(
                     result["id"], _money(result["moved_now"]), _money(result["deficit"]),
                     result["deadline"] or "-"))
@@ -342,12 +345,13 @@ def _dispatch(args, ledger, broker, router) -> int:
             else:
                 money_keys = {"cash", "reserved_cash", "positions_value", "equity",
                               "buying_power", "realized_pnl", "unrealized_pnl",
-                              "max_order_notional", "daily_loss_limit"}
+                              "max_order_notional", "daily_loss_limit", "cash_call"}
                 for key in ("id", "name", "active", "cash", "reserved_cash",
                             "positions_value", "equity", "buying_power",
                             "realized_pnl", "unrealized_pnl", "margin_multiplier",
                             "max_order_notional", "daily_loss_limit",
-                            "symbol_whitelist", "allow_short"):
+                            "symbol_whitelist", "allow_short",
+                            "cash_call", "cash_call_deadline"):
                     value = _money(view[key]) if key in money_keys else view[key]
                     print("{:20s} {}".format(key, value))
                 if view["positions"]:
