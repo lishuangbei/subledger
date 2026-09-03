@@ -131,6 +131,11 @@ class SubAccount:
     active: bool = True
     realized_pnl: Decimal = ZERO
     realized_pnl_today: Decimal = ZERO
+    # Outstanding cash call: capital the admin has reclaimed that this
+    # sub-account still owes the pool. While > 0, buying is frozen; the
+    # daemon sweeps free cash toward it and force-liquidates past the deadline.
+    cash_call: Decimal = ZERO
+    cash_call_deadline: Optional[str] = None     # ISO-8601 UTC
 
 
 @dataclass

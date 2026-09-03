@@ -202,6 +202,15 @@ def run(stack, argv) -> int:
     p_update.add_argument("--active", dest="active", action="store_true", default=None)
     p_update.add_argument("--inactive", dest="active", action="store_false")
 
+    p_call = acc_sub.add_parser("cashcall",
+                                help="reclaim capital: free cash moves now, the rest becomes "
+                                     "an outstanding call (buying frozen, swept, then liquidated)")
+    p_call.add_argument("id")
+    p_call.add_argument("amount")
+    p_call.add_argument("--deadline", default=None,
+                        help="ISO-8601 UTC; default = next full session close")
+    p_call.add_argument("--note", default="")
+
     p_alloc = acc_sub.add_parser("allocate")
     p_alloc.add_argument("id")
     p_alloc.add_argument("amount")
@@ -298,6 +307,15 @@ def _dispatch(args, ledger, broker, router) -> int:
                 fields["active"] = args.active
             updated = ledger.update_sub_account_settings(args.id, **fields)
             _emit(_acct_dict(ledger, router, updated), args.json)
+        elif args.subcommand == "cashcall":
+            result = _issue_cash_call(ledger, router, args)
+            _emit(result, args.json)
+            if not args.json:
+                print("cash call #{}: moved now {}  outstanding {}  deadline {}".format(
+                    result["id"], _money(result["moved_now"]), _money(result["deficit"]),
+                    result["deadline"] or "-"))
+            return 0
+
         elif args.subcommand == "allocate":
             ledger.allocate(args.id, Decimal(args.amount))
             _emit({"id": args.id, "moved": args.amount,
@@ -456,6 +474,7 @@ def _dispatch(args, ledger, broker, router) -> int:
         eq = ledger.equity_history(limit=1)
         configs = [{
             "id": a.id, "name": a.name, "active": a.active,
+            "cash_call": str(a.cash_call), "cash_call_deadline": a.cash_call_deadline,
             "margin_multiplier": str(a.margin_multiplier),
             "max_order_notional": None if a.max_order_notional is None else str(a.max_order_notional),
             "daily_loss_limit": None if a.daily_loss_limit is None else str(a.daily_loss_limit),
@@ -719,6 +738,39 @@ def _paint_return(text: str, window: str, pct, reliable: bool) -> str:
 
 def _returns_legend() -> str:
     return "\033[48;5;231m\033[38;5;232m 白底 \033[0m = 不可信(窗口内有资金变动/持有期短于窗口)"
+
+
+def _issue_cash_call(ledger, router, args):
+    """A cash call moves money, so it must run inside the writer. If a daemon
+    holds the lock, hand the request to its REST surface instead of writing
+    beside it."""
+    import json as _json
+    import os as _os
+    import urllib.request
+
+    lock_path = str(getattr(ledger, "path", "")) + ".lock"
+    daemon_pid = None
+    try:
+        daemon_pid = int(open(lock_path).read().strip())
+        _os.kill(daemon_pid, 0)
+    except (OSError, ValueError):
+        daemon_pid = None
+    if daemon_pid and daemon_pid != _os.getpid():
+        base = _os.environ.get("SUBLEDGER_REST_URL")
+        if not base and _os.environ.get("TRIAL_REST_PORT"):
+            base = "http://127.0.0.1:{}".format(_os.environ["TRIAL_REST_PORT"])
+        if not base:
+            raise SystemExit("daemon (pid {}) holds the ledger and no REST url is configured "
+                             "(SUBLEDGER_REST_URL / TRIAL_REST_PORT)".format(daemon_pid))
+        body = _json.dumps({"amount": args.amount, "deadline": args.deadline,
+                            "note": args.note}).encode()
+        req = urllib.request.Request(
+            "{}/accounts/{}/cash_call".format(base.rstrip("/"), args.id),
+            data=body, method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return _json.loads(resp.read())
+    deadline = args.deadline or router.default_cash_call_deadline()
+    return ledger.issue_cash_call(args.id, Decimal(args.amount), deadline, args.note)
 
 
 _VIEW_COMMANDS = {"status", "positions", "equity", "returns", "history", "orders"}

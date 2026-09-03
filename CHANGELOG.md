@@ -1,5 +1,26 @@
 # Changelog
 
+## unreleased — 2026-09-03:cash call(强制资金收回)
+
+admin 从子账户收回资金的执法机制,三段式:
+- **发起**:`accounts cashcall <id> <amount> [--deadline ISO] [--note]` /
+  `POST /accounts/{id}/cash_call`。可用现金即刻划回池;差额登记为欠款
+  (`cash_call`,`cash_call_deadline`,审计表 `cash_calls`)。CLI 在 daemon
+  持锁时自动经 REST 提交(`SUBLEDGER_REST_URL` / `TRIAL_REST_PORT`)。
+  默认 deadline = 下一个完整交易日收盘。
+- **冻结**:欠款存续期间风控拒绝该子账户一切买入;卖出照常。
+- **划扣**:`Router.enforce_cash_calls()` 每 cycle 把回笼的可用现金划入池,
+  欠款归零即解冻并结案(审计 resolution=swept)。
+- **强清**:deadline 过 + 市场开盘 + 未 halt → 机械清算:按市值从大到小、
+  整数股(碎股尾巴整仓例外)、只撤被卖标的的挂单、市价卖到覆盖为止,
+  tag `cashcall-<sym>`。**halt 优先于强清**(存疑账本上不强卖),闭市顺延。
+- 账户视图(REST/CLI)含 `cash_call` / `cash_call_deadline`;`GET /cash_calls`
+  审计历史。
+- 语义变更:`active=False` 现在只禁止**买入**,卖出保留——停用账户必须
+  仍可清仓(关账户 / 强清路径)。
+- 118 tests。
+
+
 ## unreleased — 2026-08-31
 
 - REST `_order_view` 增加 `time_in_force` 字段(账本本就存储,此前未序列化)。

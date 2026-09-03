@@ -34,6 +34,19 @@ CREATE TABLE IF NOT EXISTS master (
 );
 INSERT OR IGNORE INTO master (id) VALUES (1);
 
+CREATE TABLE IF NOT EXISTS cash_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sub_account_id TEXT NOT NULL,
+    requested TEXT NOT NULL,
+    moved_now TEXT NOT NULL,
+    deficit_initial TEXT NOT NULL,
+    deadline TEXT,
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    resolved_at TEXT,
+    resolution TEXT
+);
+
 CREATE TABLE IF NOT EXISTS sub_accounts (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL DEFAULT '',
@@ -116,6 +129,11 @@ CREATE INDEX IF NOT EXISTS idx_equity_sub_at ON equity_snapshots (sub_account_id
 
 # Columns added after the original schema; applied via ALTER TABLE so an
 # existing ledger.db upgrades in place without data loss.
+_SUB_ACCOUNT_MIGRATIONS = [
+    ("cash_call", "TEXT NOT NULL DEFAULT '0'"),
+    ("cash_call_deadline", "TEXT"),
+]
+
 _ORDER_MIGRATIONS = [
     ("stop_price", "TEXT"),
     ("trail_percent", "TEXT"),
@@ -129,6 +147,11 @@ _ORDER_MIGRATIONS = [
 
 
 def _now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+def _utc_now() -> str:
+    import datetime as _dt
     return _dt.datetime.now(_dt.timezone.utc).isoformat()
 
 
@@ -175,6 +198,15 @@ class Ledger:
                 if column not in existing:
                     self._conn.execute(
                         "ALTER TABLE orders ADD COLUMN {} {}".format(column, decl)
+                    )
+            existing_sub = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(sub_accounts)").fetchall()
+            }
+            for column, decl in _SUB_ACCOUNT_MIGRATIONS:
+                if column not in existing_sub:
+                    self._conn.execute(
+                        "ALTER TABLE sub_accounts ADD COLUMN {} {}".format(column, decl)
                     )
             self._conn.commit()
 
@@ -271,7 +303,8 @@ class Ledger:
                 """UPDATE sub_accounts SET
                    name=?, cash=?, reserved_cash=?, margin_multiplier=?,
                    max_order_notional=?, daily_loss_limit=?, symbol_whitelist=?,
-                   allow_short=?, active=?, realized_pnl=?, realized_pnl_today=?
+                   allow_short=?, active=?, realized_pnl=?, realized_pnl_today=?,
+                   cash_call=?, cash_call_deadline=?
                    WHERE id=?""",
                 (
                     acct.name,
@@ -285,6 +318,8 @@ class Ledger:
                     int(acct.active),
                     str(acct.realized_pnl),
                     str(acct.realized_pnl_today),
+                    str(acct.cash_call),
+                    acct.cash_call_deadline,
                     acct.id,
                 ),
             )
@@ -318,6 +353,8 @@ class Ledger:
             symbol_whitelist=None if wl is None else json.loads(wl),
             allow_short=bool(row["allow_short"]),
             active=bool(row["active"]),
+            cash_call=Decimal(row["cash_call"] if "cash_call" in row.keys() and row["cash_call"] is not None else "0"),
+            cash_call_deadline=(row["cash_call_deadline"] if "cash_call_deadline" in row.keys() else None),
             realized_pnl=Decimal(row["realized_pnl"]),
             realized_pnl_today=Decimal(row["realized_pnl_today"]),
         )
@@ -396,6 +433,73 @@ class Ledger:
             acct.cash += amount
             self.set_unallocated_cash(pool - amount)
             self.save_sub_account(acct)
+
+    # -- cash calls -----------------------------------------------------
+
+    def issue_cash_call(self, sub_id: str, amount: Decimal, deadline: Optional[str],
+                        note: str = "") -> dict:
+        """Reclaim `amount` from a sub-account into the pool. Whatever is
+        free moves immediately; the remainder becomes an outstanding cash
+        call (buying frozen, swept as cash arrives, force-liquidated past
+        `deadline`). Stacks onto any existing call."""
+        if amount <= ZERO:
+            raise ValueError("cash call amount must be positive")
+        with self._lock:
+            acct = self.get_sub_account(sub_id)
+            free = acct.cash - acct.reserved_cash
+            moved = min(max(free, ZERO), amount)
+            deficit = amount - moved
+            acct.cash -= moved
+            self.set_unallocated_cash(self.unallocated_cash() + moved)
+            acct.cash_call += deficit
+            if deficit > ZERO:
+                # keep the earlier deadline when stacking
+                if acct.cash_call_deadline is None or (deadline and deadline < acct.cash_call_deadline):
+                    acct.cash_call_deadline = deadline
+            self.save_sub_account(acct)
+            now = _utc_now()
+            cur = self._conn.execute(
+                """INSERT INTO cash_calls (sub_account_id, requested, moved_now,
+                   deficit_initial, deadline, note, created_at, resolved_at, resolution)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (sub_id, str(amount), str(moved), str(deficit), deadline, note, now,
+                 now if deficit <= ZERO else None, "settled_immediately" if deficit <= ZERO else None))
+            self._conn.commit()
+            return {"id": cur.lastrowid, "sub_account_id": sub_id, "requested": str(amount),
+                    "moved_now": str(moved), "deficit": str(acct.cash_call),
+                    "deadline": acct.cash_call_deadline}
+
+    def sweep_cash_call(self, sub_id: str) -> Decimal:
+        """Move free cash toward an outstanding call. Returns the amount
+        swept; resolves the call (and its audit rows) when it reaches zero."""
+        with self._lock:
+            acct = self.get_sub_account(sub_id)
+            if acct.cash_call <= ZERO:
+                return ZERO
+            free = acct.cash - acct.reserved_cash
+            take = min(max(free, ZERO), acct.cash_call)
+            if take <= ZERO:
+                return ZERO
+            acct.cash -= take
+            acct.cash_call -= take
+            self.set_unallocated_cash(self.unallocated_cash() + take)
+            if acct.cash_call <= ZERO:
+                acct.cash_call = ZERO
+                acct.cash_call_deadline = None
+                self._conn.execute(
+                    "UPDATE cash_calls SET resolved_at=?, resolution='swept' "
+                    "WHERE sub_account_id=? AND resolved_at IS NULL", (_utc_now(), sub_id))
+            self.save_sub_account(acct)
+            self._conn.commit()
+            return take
+
+    def open_cash_calls(self) -> List[SubAccount]:
+        return [a for a in self.list_sub_accounts() if a.cash_call > ZERO]
+
+    def cash_call_history(self, sub_id: Optional[str] = None) -> List[dict]:
+        q = "SELECT * FROM cash_calls" + (" WHERE sub_account_id=?" if sub_id else "") + " ORDER BY id"
+        rows = self._conn.execute(q, (sub_id,) if sub_id else ()).fetchall()
+        return [dict(r) for r in rows]
 
     # -- positions ------------------------------------------------------
 

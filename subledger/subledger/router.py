@@ -360,6 +360,90 @@ class Router:
             self._sync_one(order)
             return self.ledger.get_order(order_id)
 
+    # -- cash calls ------------------------------------------------------
+
+    def default_cash_call_deadline(self) -> str:
+        """Next full session's close: gives the strategy one trading day to
+        raise the cash gracefully before mechanical liquidation."""
+        import datetime as _dt
+
+        clock = self.broker.get_clock()
+        try:
+            close = _dt.datetime.fromisoformat(str(clock.next_close))
+        except ValueError:
+            return (_dt.datetime.now(_dt.timezone.utc) + _dt.timedelta(days=1)).isoformat()
+        if clock.is_open:
+            close = close + _dt.timedelta(days=1)   # today's close is too soon
+        return close.astimezone(_dt.timezone.utc).isoformat()
+
+    def enforce_cash_calls(self, market_open: bool, now: Optional[str] = None) -> dict:
+        """Run from the daemon cycle. For every outstanding call: sweep free
+        cash to the pool; if the deadline has passed and the market is open
+        and the router is not halted, liquidate mechanically — largest
+        position first, whole shares, until the deficit is covered. Halt
+        wins over enforcement: a halted ledger is a doubted ledger."""
+        import datetime as _dt
+
+        now = now or _dt.datetime.now(_dt.timezone.utc).isoformat()
+        report = {"swept": {}, "liquidated": {}, "deferred": []}
+        with self._lock:
+            calls = self.ledger.open_cash_calls()
+        for acct in calls:
+            swept = self.ledger.sweep_cash_call(acct.id)
+            if swept > ZERO:
+                report["swept"][acct.id] = str(swept)
+            acct = self.ledger.get_sub_account(acct.id)
+            if acct.cash_call <= ZERO:
+                continue
+            overdue = acct.cash_call_deadline is not None and now >= acct.cash_call_deadline
+            if not overdue:
+                continue
+            if not market_open or self.ledger.is_halted():
+                report["deferred"].append(acct.id)
+                continue
+            report["liquidated"][acct.id] = self._liquidate_for_cash_call(acct)
+        return report
+
+    def _liquidate_for_cash_call(self, acct: SubAccount) -> list:
+        """Mechanical, preference-blind: sell largest market value first.
+        Protection orders are canceled only on the symbols being sold."""
+        remaining = acct.cash_call - max(acct.cash - acct.reserved_cash, ZERO)
+        positions = [p for p in self.ledger.list_positions(acct.id) if p.qty > ZERO]
+        positions.sort(key=lambda p: p.qty * p.last_price, reverse=True)
+        actions = []
+        for pos in positions:
+            if remaining <= ZERO:
+                break
+            price = pos.last_price
+            if price <= ZERO:
+                continue
+            whole = int(pos.qty)
+            want = int(remaining / price) + 1
+            qty = Decimal(min(whole, want))
+            if qty >= whole:
+                qty = pos.qty            # entire position (fractional remainder allowed)
+            if qty <= ZERO:
+                continue
+            for order in self.ledger.list_orders(acct.id, open_only=True):
+                if order.symbol == pos.symbol and order.parent_order_id is None:
+                    try:
+                        self.cancel_order(order.id)
+                    except Exception as exc:
+                        logger.warning("cash-call: cancel %s failed: %s", order.id, exc)
+            try:
+                placed = self.place_order(OrderRequest(
+                    acct.id, pos.symbol, OrderSide.SELL, qty,
+                    order_type=OrderType.MARKET,
+                    client_tag="cashcall-{}".format(pos.symbol.lower())), est_price=price)
+                actions.append({"symbol": pos.symbol, "qty": str(qty), "order_id": placed.id})
+                remaining -= qty * price
+                logger.warning("cash-call liquidation: sold %s %s for sub-account %s",
+                               qty, pos.symbol, acct.id)
+            except OrderRejected as exc:
+                actions.append({"symbol": pos.symbol, "qty": str(qty), "rejected": str(exc)})
+                logger.warning("cash-call liquidation rejected for %s: %s", pos.symbol, exc)
+        return actions
+
     def sync(self) -> int:
         """Poll the broker for every non-terminal local order (legs included)
         and book any state changes. Returns the number of orders updated. Run

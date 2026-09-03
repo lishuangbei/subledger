@@ -139,8 +139,14 @@ def check_order(
     """
     if halted:
         raise RiskViolation("router is halted (kill switch engaged)")
-    if not acct.active:
+    if not acct.active and req.side == OrderSide.BUY:
+        # Disabled = no NEW exposure. Sells stay allowed so a disabled account
+        # can still be flattened (account close-out, cash-call liquidation).
         raise RiskViolation("sub-account {} is disabled".format(acct.id))
+    if acct.cash_call > ZERO and req.side == OrderSide.BUY:
+        raise RiskViolation(
+            "cash call outstanding ({} owed to the pool): buying is frozen "
+            "until it is repaid".format(acct.cash_call))
 
     validate_structure(req)
     _validate_whole_shares(pos, req)

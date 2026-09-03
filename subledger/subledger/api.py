@@ -86,6 +86,11 @@ if _HAVE_PYDANTIC:
         limit_price: Optional[str] = None
         stop_price: Optional[str] = None
 
+    class CashCallBody(_BaseModel):
+        amount: str
+        deadline: Optional[str] = None     # ISO-8601; default = next session close
+        note: str = ""
+
 
 def _build_stack():
     """Assemble ledger/broker/router from environment variables."""
@@ -143,6 +148,11 @@ def create_app(stack=None, background_loops: bool = True):
                     # shows up as cash drift (and halts when halt_on_drift).
                     reconciler.attribute_cash_activities()
                     reconciler.run()
+                    try:
+                        router.enforce_cash_calls(market_open=broker.get_clock().is_open)
+                    except Exception:
+                        import logging
+                        logging.getLogger("subledger.api").exception("cash-call enforcement")
                     last_reconcile = now
             except Exception:  # keep the loop alive; errors are logged upstream
                 import logging
@@ -198,6 +208,18 @@ def create_app(stack=None, background_loops: bool = True):
         except (ValueError, KeyError) as exc:
             raise HTTPException(400, str(exc))
         return _acct_view(ledger.get_sub_account(sub_id))
+
+    @app.post("/accounts/{sub_id}/cash_call")
+    def cash_call(sub_id: str, body: CashCallBody):
+        deadline = body.deadline or router.default_cash_call_deadline()
+        try:
+            return ledger.issue_cash_call(sub_id, Decimal(body.amount), deadline, body.note)
+        except (ValueError, KeyError) as exc:
+            raise HTTPException(400, str(exc))
+
+    @app.get("/cash_calls")
+    def cash_calls(sub_account_id: Optional[str] = None):
+        return ledger.cash_call_history(sub_account_id)
 
     @app.get("/accounts/{sub_id}/positions")
     def positions(sub_id: str):
@@ -338,6 +360,8 @@ def create_app(stack=None, background_loops: bool = True):
             "realized_pnl": str(a.realized_pnl),
             "realized_pnl_today": str(a.realized_pnl_today),
             "active": a.active,
+            "cash_call": str(a.cash_call),
+            "cash_call_deadline": a.cash_call_deadline,
         }
 
     def _order_view(o) -> dict:
