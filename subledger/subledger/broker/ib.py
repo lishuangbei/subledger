@@ -101,7 +101,10 @@ _DONE_STATES = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
 _NON_REJECT_CODES = frozenset({105, 110, 165, 202, 321, 329, 399, 404, 434, 492, 10167})
 
 _UNSET = 1e300        # ib_async's UNSET_DOUBLE sentinel is ~1.8e308
-OVERNIGHT_RETRY_S = 3600   # after a 10329 refusal, retry direct overnight routing this often
+OVERNIGHT_RETRY_S = 3600   # after a direct-routing refusal, retry the overnight venue this often
+# "This order will be directly routed to X ... Restriction is specified in
+# Precautionary Settings": 10311 (generic venue) / 10329 (OVERNIGHT).
+_DIRECT_ROUTING_CODES = frozenset({10311, 10329})
 _US_PRIMARY = ("NASDAQ", "NYSE", "ARCA", "AMEX", "BATS", "ISLAND", "IEX")
 
 _TIF = {
@@ -703,7 +706,7 @@ class IBBroker(BrokerAdapter):
         if dead:
             self._cancel_trades([t for t in trades if t not in dead])
             if getattr(contract, "exchange", "") == "OVERNIGHT" and any(
-                    int(getattr(e, "errorCode", 0) or 0) == 10329 for e in dead[0].log):
+                    int(getattr(e, "errorCode", 0) or 0) in _DIRECT_ROUTING_CODES for e in dead[0].log):
                 raise _DirectRoutingBlocked(_last_message(dead[0]))
             raise BrokerError("ib rejected {} {} {}: {}".format(
                 req.side.value, req.qty, req.symbol, _last_message(dead[0])))
