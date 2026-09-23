@@ -324,6 +324,10 @@ def parse_ib_hours(spec: str, tz_name: str, now: _dt.datetime) -> BrokerClock:
     return BrokerClock(is_open=current is not None, next_open=next_open, next_close=next_close)
 
 
+class _DirectRoutingBlocked(BrokerError):
+    """IB error 10329: the gateway's API precautions refuse direct routing."""
+
+
 class _CancelEchoFilter(logging.Filter):
     """IB answers every cancellation — ours included — with error 202 "Order
     Canceled", which ib_async logs at ERROR. Downgrade that one to INFO so
@@ -391,6 +395,7 @@ class IBBroker(BrokerAdapter):
         self._asset_cache: Dict[str, BrokerAsset] = {}
         self._hours: Optional[Tuple[str, str, str]] = None
         self._overnight: Dict[str, tuple] = {}
+        self._overnight_blocked = False
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
         self._listeners: List[Callable[[BrokerOrderState], None]] = []
@@ -536,10 +541,14 @@ class IBBroker(BrokerAdapter):
         return None
 
     def _scan_ref(self, client_order_id: str):
-        for trade in self._ib.trades():
-            if getattr(trade.order, "orderRef", "") == client_order_id:
-                return trade
-        return None
+        matches = [t for t in self._ib.trades()
+                   if getattr(t.order, "orderRef", "") == client_order_id]
+        if not matches:
+            return None
+        # A rejected direct-routed attempt and its SMART fallback share the
+        # orderRef: prefer a live trade, then the most recent (highest permId).
+        matches.sort(key=lambda t: (not _is_done(t), _permid(t)), reverse=True)
+        return matches[0]
 
     async def _refresh_orders(self) -> None:
         async with self._order_req_lock:
@@ -651,12 +660,24 @@ class IBBroker(BrokerAdapter):
     async def _submit(self, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:
         ib = await self._connect()
         contract = await self._contract(req.symbol)
-        if (req.extended_hours and req.order_class == OrderClass.SIMPLE
+        if (req.extended_hours and not self._overnight_blocked
+                and req.order_class == OrderClass.SIMPLE
                 and req.order_type == OrderType.LIMIT and req.time_in_force == TimeInForce.DAY):
             overnight = await self._overnight_contract(req.symbol)
             if overnight is not None:
-                contract = overnight
-                logger.info("ib: %s routed to the OVERNIGHT session", req.symbol)
+                try:
+                    return await self._place(ib, overnight, req, client_order_id)
+                except _DirectRoutingBlocked:
+                    # The gateway's API precautions refuse direct routing
+                    # (error 10329) until an operator ticks "Bypass Order
+                    # Precautions for API Orders". Remember it and fall back
+                    # to SMART + outsideRth, which rests until 04:00 ET.
+                    self._overnight_blocked = True
+                    logger.warning("ib: direct routing to OVERNIGHT is blocked by the gateway's "
+                                   "API precautions; %s falls back to SMART (pre-market)", req.symbol)
+        return await self._place(ib, contract, req, client_order_id)
+
+    async def _place(self, ib, contract, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:
         plan = build_order_plan(req, client_order_id, account=self._account)
         orders = [plan.parent] + [order for order, _ in plan.legs]
         for order in orders:
@@ -678,6 +699,9 @@ class IBBroker(BrokerAdapter):
         dead = [t for t in trades if _is_done(t) and _num(t.orderStatus.filled) <= 0]
         if dead:
             self._cancel_trades([t for t in trades if t not in dead])
+            if getattr(contract, "exchange", "") == "OVERNIGHT" and any(
+                    int(getattr(e, "errorCode", 0) or 0) == 10329 for e in dead[0].log):
+                raise _DirectRoutingBlocked(_last_message(dead[0]))
             raise BrokerError("ib rejected {} {} {}: {}".format(
                 req.side.value, req.qty, req.symbol, _last_message(dead[0])))
         legs = [

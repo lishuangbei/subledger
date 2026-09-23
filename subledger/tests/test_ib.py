@@ -77,6 +77,7 @@ class FakeIB:
         self.tickers = {}
         self.unknown = set()
         self.overnight_hours = ""       # set to a window covering "now" to open the overnight venue
+        self.block_direct_routing = False   # emulate the gateway's API precaution (error 10329)
         self.modify_error = None
         self.cancelled = []
         self.placed = []
@@ -200,7 +201,12 @@ class FakeIB:
         trade.order.permId = self._perm
         trade.orderStatus.permId = self._perm
         rejected = symbol == "REJECT" or (symbol == "REJECTLEG" and trade.order.orderType.startswith("STP"))
-        if rejected:
+        if trade.contract.exchange == "OVERNIGHT" and self.block_direct_routing:
+            trade.orderStatus.status = "Cancelled"
+            trade.log.append(TradeLogEntry(_now(), "Cancelled",
+                                           "Error 10329, reqId 1: This order will be directly routed to OVERNIGHT. "
+                                           "Restriction is specified in Precautionary Settings", 10329))
+        elif rejected:
             trade.orderStatus.status = "Cancelled"
             trade.log.append(TradeLogEntry(_now(), "Cancelled",
                                            "Error 201, reqId 1: Order rejected - reason:no cash", 201))
@@ -389,6 +395,23 @@ class IBBrokerTests(unittest.TestCase):
         # not for GTC / non-limit / exit groups
         self.broker.submit_order(order(order_type=OrderType.LIMIT, limit_price=D("95"), extended_hours=True,
                                        time_in_force=TimeInForce.GTC), "sl.alpha.x3")
+        self.assertEqual(self.fake.placed[-1].contract.exchange, "SMART")
+
+    def test_overnight_blocked_falls_back_to_smart(self):
+        now = dt.datetime.now(dt.timezone.utc).astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
+        self.fake.overnight_hours = "{}-{}".format((now - dt.timedelta(hours=1)).strftime("%Y%m%d:%H%M"),
+                                                   (now + dt.timedelta(hours=1)).strftime("%Y%m%d:%H%M"))
+        self.fake.block_direct_routing = True
+        req = order(order_type=OrderType.LIMIT, limit_price=D("95"), extended_hours=True)
+        result = self.broker.submit_order(req, "sl.alpha.ovn")
+        attempts = [t for t in self.fake.placed if t.order.orderRef == "sl.alpha.ovn"]
+        self.assertEqual([t.contract.exchange for t in attempts], ["OVERNIGHT", "SMART"])
+        self.assertEqual(result.broker_order_id, str(attempts[1].order.permId))
+        self.assertEqual(self.broker.get_order(result.broker_order_id).status, "open")
+        # repair lookup must find the live SMART order, not the rejected attempt
+        self.assertEqual(self.broker.get_order_by_client_id("sl.alpha.ovn").broker_order_id, result.broker_order_id)
+        # remembered: the next order goes straight to SMART
+        self.broker.submit_order(req, "sl.alpha.ovn2")
         self.assertEqual(self.fake.placed[-1].contract.exchange, "SMART")
 
     def test_market_fill_reported(self):
