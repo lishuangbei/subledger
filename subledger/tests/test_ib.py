@@ -410,9 +410,14 @@ class IBBrokerTests(unittest.TestCase):
         self.assertEqual(self.broker.get_order(result.broker_order_id).status, "open")
         # repair lookup must find the live SMART order, not the rejected attempt
         self.assertEqual(self.broker.get_order_by_client_id("sl.alpha.ovn").broker_order_id, result.broker_order_id)
-        # remembered: the next order goes straight to SMART
+        # remembered: the next order goes straight to SMART ...
         self.broker.submit_order(req, "sl.alpha.ovn2")
         self.assertEqual(self.fake.placed[-1].contract.exchange, "SMART")
+        # ... until the retry window elapses (operator may have fixed the gateway)
+        self.broker._overnight_blocked_until = 0.0
+        self.fake.block_direct_routing = False
+        self.broker.submit_order(req, "sl.alpha.ovn3")
+        self.assertEqual(self.fake.placed[-1].contract.exchange, "OVERNIGHT")
 
     def test_market_fill_reported(self):
         self.fake.price = 123.456789

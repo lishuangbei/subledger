@@ -101,6 +101,7 @@ _DONE_STATES = ("Filled", "Cancelled", "ApiCancelled", "Inactive")
 _NON_REJECT_CODES = frozenset({105, 110, 165, 202, 321, 329, 399, 404, 434, 492, 10167})
 
 _UNSET = 1e300        # ib_async's UNSET_DOUBLE sentinel is ~1.8e308
+OVERNIGHT_RETRY_S = 3600   # after a 10329 refusal, retry direct overnight routing this often
 _US_PRIMARY = ("NASDAQ", "NYSE", "ARCA", "AMEX", "BATS", "ISLAND", "IEX")
 
 _TIF = {
@@ -395,7 +396,7 @@ class IBBroker(BrokerAdapter):
         self._asset_cache: Dict[str, BrokerAsset] = {}
         self._hours: Optional[Tuple[str, str, str]] = None
         self._overnight: Dict[str, tuple] = {}
-        self._overnight_blocked = False
+        self._overnight_blocked_until = 0.0     # monotonic; direct routing retried after it
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
         self._listeners: List[Callable[[BrokerOrderState], None]] = []
@@ -660,7 +661,7 @@ class IBBroker(BrokerAdapter):
     async def _submit(self, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:
         ib = await self._connect()
         contract = await self._contract(req.symbol)
-        if (req.extended_hours and not self._overnight_blocked
+        if (req.extended_hours and time.monotonic() >= self._overnight_blocked_until
                 and req.order_class == OrderClass.SIMPLE
                 and req.order_type == OrderType.LIMIT and req.time_in_force == TimeInForce.DAY):
             overnight = await self._overnight_contract(req.symbol)
@@ -669,12 +670,14 @@ class IBBroker(BrokerAdapter):
                     return await self._place(ib, overnight, req, client_order_id)
                 except _DirectRoutingBlocked:
                     # The gateway's API precautions refuse direct routing
-                    # (error 10329) until an operator ticks "Bypass Order
-                    # Precautions for API Orders". Remember it and fall back
-                    # to SMART + outsideRth, which rests until 04:00 ET.
-                    self._overnight_blocked = True
+                    # (error 10329) until an operator ticks the direct-routing
+                    # bypass. Fall back to SMART + outsideRth (rests until
+                    # 04:00 ET) and stop trying for an hour, so an operator's
+                    # change is picked up without a restart.
+                    self._overnight_blocked_until = time.monotonic() + OVERNIGHT_RETRY_S
                     logger.warning("ib: direct routing to OVERNIGHT is blocked by the gateway's "
-                                   "API precautions; %s falls back to SMART (pre-market)", req.symbol)
+                                   "API precautions; %s falls back to SMART (pre-market); "
+                                   "next direct attempt in %d min", req.symbol, OVERNIGHT_RETRY_S // 60)
         return await self._place(ib, contract, req, client_order_id)
 
     async def _place(self, ib, contract, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:
