@@ -368,6 +368,7 @@ class IBBroker(BrokerAdapter):
         self._ib_factory = ib_factory
         self._ib = None
         self._fatal: Optional[str] = None
+        self._closing = False
         self._next_attempt = 0.0
         self._backoff = 2.0
         self._contracts: Dict[str, Any] = {}
@@ -462,6 +463,8 @@ class IBBroker(BrokerAdapter):
         return self._ib
 
     def _on_disconnected(self, *_args) -> None:
+        if self._closing:
+            return
         logger.warning("ib gateway %s:%s disconnected; reconnecting on next call", self._host, self._port)
 
     def _on_open_order(self, trade) -> None:
@@ -497,6 +500,8 @@ class IBBroker(BrokerAdapter):
                     logger.exception("ib order listener failed")
 
     def close(self) -> None:
+        self._closing = True
+
         async def _disconnect():
             if self._ib is not None and self._ib.isConnected():
                 self._ib.disconnect()
