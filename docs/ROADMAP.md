@@ -11,6 +11,8 @@
   分红/费用归属、净值历史、账户校验(expected_account_id)、
   排他写者锁(flock 硬性单写者)、CLI、每日备份、WAL 低延迟
 - 实测:router 自身开销 p50 0.07ms / p95 0.09ms(`python -m subledger.bench`)
+- 券商:Alpaca、Interactive Brokers(2026-09-22,`broker/ib.py`:permId/orderRef
+  归属、OCA/bracket、真改单、佣金归属子账户、延迟行情、通用 daemon)
 
 ## 待办(按需触发)
 
@@ -18,7 +20,7 @@
 |---|---|
 | `halt_on_drift` 生产演练 | 任何部署转真实资金前 |
 | REST 层鉴权 + SSE 事件推送 | 策略以独立进程接入时 |
-| IB adapter(`BrokerAdapter` 五方法 + `orderRef` 归属) | 接入 IB 时 |
+| IB 开盘时段成交 + 佣金归属实弹回归(paper) | 下一交易日 |
 | 空头完整支持(买回腿共享现金预留、卖空记账) | 出现做空策略时 |
 | 公司行动工具(拆股调账) | 遇到拆股时 |
 | CI 恢复(`docs/ci-tests.yml.hold` → `.github/workflows/`) | push token 获得 workflow 权限后 |

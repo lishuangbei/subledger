@@ -165,14 +165,22 @@ class Reconciler:
         Attribution policy:
           - dividend with a symbol: credited to the sub-accounts holding that
             symbol, proportional to qty (also counted as realized P&L)
+          - fee tagged with a router client id (per-order commissions, e.g.
+            IB): charged to the sub-account that placed the order (realized
+            P&L)
           - anything unattributable (fees without symbol, other): booked to
             the unallocated pool ("unassigned")
         Idempotent: each broker activity id is processed exactly once.
+        `after` defaults to the ledger's inception instant (adopt time).
         """
         import json as _json
 
         processed = set(self.ledger.processed_activity_ids())
-        result = {"dividends": 0, "pool": 0, "total_amount": ZERO}
+        result = {"dividends": 0, "fees": 0, "pool": 0, "total_amount": ZERO}
+        if not after:
+            # Activities dated before the ledger adopted the account's cash
+            # are already inside that balance (same-day commissions, etc.).
+            after = self.ledger.inception_at() or ""
         try:
             activities = self.broker.get_cash_activities(after=after)
         except BrokerError as exc:
@@ -196,12 +204,29 @@ class Reconciler:
                 continue
             allocations = {}
             holders = []
+            owner = None
+            if activity.kind == "fee" and activity.order_client_id:
+                owner_id = sub_account_of(activity.order_client_id)
+                if owner_id is not None:
+                    try:
+                        owner = self.ledger.get_sub_account(owner_id)
+                    except KeyError:
+                        owner = None
             if activity.kind == "dividend" and activity.symbol:
                 holders = [
                     p for p in self.ledger.list_positions()
                     if p.symbol == activity.symbol and p.qty > ZERO
                 ]
-            if holders:
+            if owner is not None:
+                owner.cash += activity.amount
+                owner.realized_pnl += activity.amount
+                owner.realized_pnl_today += activity.amount
+                self.ledger.save_sub_account(owner)
+                allocations[owner.id] = str(activity.amount)
+                result["fees"] += 1
+                logger.info("fee %s %s (%s) charged to sub-account %s",
+                            activity.symbol, activity.amount, activity.order_client_id, owner.id)
+            elif holders:
                 total_qty = sum((p.qty for p in holders), ZERO)
                 remaining = activity.amount
                 for i, pos in enumerate(holders):

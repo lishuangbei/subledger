@@ -93,7 +93,13 @@ if _HAVE_PYDANTIC:
 
 
 def _build_stack():
-    """Assemble ledger/broker/router from environment variables."""
+    """Assemble ledger/broker/router from environment variables.
+
+    SUBLEDGER_BROKER=mock|alpaca|ib
+      alpaca: ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER
+      ib:     IB_HOST (127.0.0.1) / IB_PORT (4002) / IB_CLIENT_ID (11) /
+              IB_ACCOUNT (optional) / IB_PAPER (true) / IB_MARKET_DATA_TYPE (3)
+    """
     readonly = os.environ.get("SUBLEDGER_READONLY", "").lower() in ("1", "true", "yes")
     ledger = Ledger(os.environ.get("SUBLEDGER_DB", "subledger.db"),
                     exclusive_writer=not readonly)
@@ -105,6 +111,23 @@ def _build_stack():
             api_key=os.environ["ALPACA_API_KEY"],
             secret_key=os.environ["ALPACA_SECRET_KEY"],
             paper=os.environ.get("ALPACA_PAPER", "true").lower() != "false",
+        )
+    elif broker_kind == "ib":
+        from .broker.ib import IBBroker
+
+        client_id = int(os.environ.get("IB_CLIENT_ID", "11"))
+        if readonly:
+            # Viewer processes (CLI views) must not collide with the writer's
+            # client id, nor with each other: derive one from the pid.
+            client_id = int(os.environ.get("IB_READONLY_CLIENT_ID_BASE", "900")) + os.getpid() % 100
+        broker = IBBroker(
+            host=os.environ.get("IB_HOST", "127.0.0.1"),
+            port=int(os.environ.get("IB_PORT", "4002")),
+            client_id=client_id,
+            account=os.environ.get("IB_ACCOUNT", ""),
+            paper=os.environ.get("IB_PAPER", "true").lower() != "false",
+            market_data_type=int(os.environ.get("IB_MARKET_DATA_TYPE", "3")),
+            readonly=readonly,
         )
     else:
         from .broker.mock import MockBroker

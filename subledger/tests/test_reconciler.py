@@ -72,6 +72,43 @@ class ReconcilerTest(unittest.TestCase):
         self.assertEqual(pos.last_price, D("240"))
         self.assertEqual(pos.unrealized_pnl, D("400"))
 
+    def test_fee_with_order_attribution_charged_to_owner(self):
+        # IB-style commission: the activity names the order's client id, so
+        # the owning sub-account pays it (realized P&L), not the pool.
+        self.trade("10")
+        pool_before = self.ledger.unallocated_cash()
+        self.broker.inject_cash_activity("fee", D("-1.05"), symbol="AAPL",
+                                         order_client_id="sl.alpha.entry1")
+        result = self.reconciler.attribute_cash_activities()
+        self.assertEqual(result["fees"], 1)
+        acct = self.ledger.get_sub_account("alpha")
+        self.assertEqual(acct.cash, D("27998.95"))
+        self.assertEqual(acct.realized_pnl, D("-1.05"))
+        self.assertEqual(self.ledger.unallocated_cash(), pool_before)
+        self.assertTrue(self.reconciler.run().ok)
+        # unknown owner falls back to the pool
+        self.broker.inject_cash_activity("fee", D("-0.5"), symbol="AAPL",
+                                         order_client_id="sl.ghost.x")
+        self.reconciler.attribute_cash_activities()
+        self.assertEqual(self.ledger.unallocated_cash(), pool_before - D("0.5"))
+        self.assertTrue(self.reconciler.run().ok)
+
+    def test_activities_before_inception_are_not_booked(self):
+        # adopt happened in setUp; a commission dated before it was already
+        # inside the adopted cash balance and must be ignored.
+        inception = self.ledger.inception_at()
+        self.assertIsNotNone(inception)
+        self.broker.activities.append(__import__("subledger.broker.base", fromlist=["BrokerCashActivity"]).BrokerCashActivity(
+            activity_id="old-fee", kind="fee", amount=D("-34"), symbol="MNQZ6",
+            at="2000-01-01T00:00:00+00:00"))
+        pool = self.ledger.unallocated_cash()
+        result = self.reconciler.attribute_cash_activities()
+        self.assertEqual((result["fees"], result["pool"]), (0, 0))
+        self.assertEqual(self.ledger.unallocated_cash(), pool)
+        self.broker.inject_cash_activity("fee", D("-2"), symbol="AAPL", at="2999-01-01T00:00:00+00:00")
+        self.reconciler.attribute_cash_activities()
+        self.assertEqual(self.ledger.unallocated_cash(), pool - D("2"))
+
     def test_report_persisted(self):
         self.reconciler.run()
         latest = self.ledger.latest_reconciliation()

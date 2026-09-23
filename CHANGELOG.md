@@ -1,5 +1,33 @@
 # Changelog
 
+## unreleased — 2026-09-22:Interactive Brokers 适配器
+
+- **`broker/ib.py` — `IBBroker`**(ib_async ≥ 2.0,`pip install "subledger[ib]"`,
+  惰性导入):BrokerAdapter 全表面——market/limit/stop/stop_limit/trailing_stop、
+  OCO(OCA 组)/bracket/OTO(附属子单)、day/gtc/ioc/fok/opg/cls(MOC/LOC)、
+  extended_hours(outsideRth)、真改单(同 permId)、按 orderRef 反查(crash
+  repair)、全 client 列单(对账外来单)、账户/持仓、延迟行情 marks、SPY
+  liquidHours 时钟、commission → fee 活动(带 orderRef)。私有事件循环线程,
+  同步线程安全;断连自动重连(指数退避);`IB_PAPER` 账户号前缀硬守卫;
+  只读视图 client id 按 pid 派生,不与写者冲突
+- **`BrokerCashActivity.order_client_id`** + Reconciler:带 client id 的
+  fee 记到所属子账户(cash 与 realized P&L),不再进池子;mock
+  `inject_cash_activity(order_client_id=)`
+- **`stream.IBOrderStream`**:IB 订单事件直接 `Router.apply_stream_state`
+- **`subledger.daemon`**:通用 booking daemon(repair + REST + 推送流 + 开盘
+  时段净值快照 + 每日备份),`python -m subledger.daemon`;新实例不再各写一份
+- **CLI `ops reconcile|halt|resume|ack|absorb|attribute`**:非排他写者,daemon
+  运行中可用(把 trial.ops 的能力搬进 vendor,所有实例通用)
+- **账本起始时间**:`adopt_broker_cash` 记录 `master.inception_at`(就地迁移增列),
+  `attribute_cash_activities` 默认只取起始之后的活动——收编前同日的佣金/费用已在
+  收编现金里,不再重复记账(IB 实测踩到:同账户别的 client 当天期货佣金被二次入账)
+- `_build_stack` 识别 `SUBLEDGER_BROKER=ib`;pyproject extras `ib` / `all`
+- 150 tests(+32:假 Gateway 覆盖下单/组合单/改单/撤单/状态映射/手续费/
+  时钟解析/事件流;reconciler 手续费归属)
+- 实测(IB Gateway 10.37 paper,账户 DU…):只读探针;挂单 → 反查 → 列单 →
+  原地改单 → 撤单 → bracket 三腿 → 子腿改单 → 撤父单 全链路;
+  开盘时段成交 + 佣金归属实弹待下一交易日
+
 ## unreleased — 2026-09-03:cash call(强制资金收回)
 
 admin 从子账户收回资金的执法机制,三段式:

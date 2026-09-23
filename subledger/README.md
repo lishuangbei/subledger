@@ -1,12 +1,12 @@
 # subledger — 自研方案：单一真实账户的虚拟子账户路由器
 
-一个真实的 Alpaca 账户，切分成多个**虚拟子账户**。每个策略只面对自己的子账户；
-路由器（Router）是唯一接触真实账户的组件。
+一个真实的券商账户（Alpaca 或 Interactive Brokers），切分成多个**虚拟子账户**。
+每个策略只面对自己的子账户；路由器（Router）是唯一接触真实账户的组件。
 
 ```
-策略 A ──┐                                      ┌─> Alpaca (real money)
+策略 A ──┐                                      ┌─> Alpaca (broker/alpaca.py)
 策略 B ──┼─> Router ──风控──> BrokerAdapter ────┤
-策略 C ──┘      │                               └─> IB (以后加 adapter 即可)
+策略 C ──┘      │                               └─> IB Gateway/TWS (broker/ib.py)
                 │
            Ledger (SQLite)          Reconciler (定时核对)
         子账户资金/持仓/PnL      ledger 总和 == 真实账户?
@@ -82,11 +82,15 @@ subledger/
   router.py       # 核心：下单->风控->预留->转发->记账
   reconciler.py   # 定时核对
   broker/
-    base.py       # BrokerAdapter 接口（对接 IB 只需实现这 5 个方法）
+    base.py       # BrokerAdapter 接口
     alpaca.py     # Alpaca 实现（alpaca-py，惰性导入）
+    ib.py         # Interactive Brokers 实现（ib_async，惰性导入；见下文）
     mock.py       # 内存模拟券商（测试/演示用）
+  stream.py       # 推送入账：Alpaca trade_updates / IB 订单事件
   api.py          # 可选 REST 层（FastAPI），策略可跨进程/跨语言接入
-tests/            # 22 个测试，零依赖可跑
+  daemon.py       # 通用 booking daemon（repair + REST + 推送流 + 净值/备份）
+  cli.py          # 运维 CLI（accounts/positions/equity/returns/orders/ops）
+tests/            # 150 个测试，核心零依赖可跑（alpaca/ib 相关未装库时自动跳过）
 examples/demo.py  # 端到端演示，无需任何凭据
 ```
 
@@ -101,6 +105,11 @@ python3 examples/demo.py
 pip install "subledger[all]"      # 或 pip install alpaca-py fastapi uvicorn
 export SUBLEDGER_BROKER=alpaca ALPACA_API_KEY=... ALPACA_SECRET_KEY=... ALPACA_PAPER=true
 uvicorn subledger.api:create_app --factory
+
+# 实盘/纸盘（Interactive Brokers：本机先跑起 TWS / IB Gateway，API 端口开启）
+pip install "subledger[ib]"       # ib_async
+export SUBLEDGER_BROKER=ib IB_PORT=4002 IB_CLIENT_ID=11 IB_PAPER=true
+python -m subledger.daemon        # 或 uvicorn subledger.api:create_app --factory
 ```
 
 Python 内嵌用法（策略和路由器同进程）：
@@ -134,12 +143,55 @@ curl :8000/reconcile/latest
 curl -X POST :8000/halt     # kill switch
 ```
 
-## 对接 IB 的路径
+## Interactive Brokers（`broker/ib.py`，2026-09-22）
 
-`broker/base.py` 只要求 5 个方法：`submit_order / cancel_order / get_order /
-list_orders / get_account`。写一个基于 `ib_insync`（或官方 `ibapi`）的
-`IBBroker` 即可，router/ledger/reconciler 零改动。IB 的 `orderRef` 字段可以
-承载我们的 client_order_id 归属编码。
+`IBBroker` 基于 [ib_async](https://github.com/ib-api-reloaded/ib_async)，
+连接本机 TWS / IB Gateway 的 API 端口（paper 4002 / 7497，live 4001 / 7496）。
+ib_async 是 asyncio 库且非线程安全，而 router / reconciler / REST / daemon
+会从多个线程调适配器——所以适配器自带一个私有事件循环线程，所有方法对
+调用方**同步且线程安全**。
+
+```bash
+SUBLEDGER_BROKER=ib
+IB_HOST=127.0.0.1  IB_PORT=4002  IB_CLIENT_ID=11   # 写者用的 client id
+IB_ACCOUNT=        # 留空 = 会话的第一个账户；FA 多账户时填账户号
+IB_PAPER=true      # 硬守卫：true 要求账户号 D 开头(paper)，false 要求 U 开头(真金)
+IB_MARKET_DATA_TYPE=3   # 1 实时(需 API 行情订阅) 3 延迟(默认) 4 延迟冻结
+```
+
+| subledger 概念 | IB 映射 |
+|---|---|
+| `broker_order_id` | **permId**（跨会话、跨 API client 稳定；orderId 是 client 私有序号，不用） |
+| `client_order_id` | **orderRef**（所有 client 可见，成交回报也带 → 归属跨重启） |
+| OCO（保护多头） | 两张 SELL 同一 `ocaGroup`（= client id）、`ocaType=1` |
+| bracket / OTO | 父单 + 附属子单（`parentId` + transmit 链），一腿成交另一腿由 IB 撤 |
+| replace | **真改单**（同 permId，返回的 id 不变；orderRef 不换） |
+| TIF `cls` | MOC / LOC 订单类型；`opg` → tif OPG |
+| notional | 不支持（整股账本策略下由 `get_asset(fractionable=False)` 在 router 层拒绝） |
+| clock | `SPY` 合约的 liquidHours（按日缓存），语义同 Alpaca |
+| marks | `reqTickers`（默认延迟行情）；拿不到的用持仓市值价兜底 |
+| 手续费 | 每笔成交的 commission 以 `fee` 活动上报，带 `order_client_id` → **记到所属子账户**（realized P&L），对账保持绿 |
+| 分红 / 利息 | TWS API 不提供 → 表现为 cash drift，`ops absorb` |
+| 推送入账 | `IBBroker.add_order_listener` / `stream.IBOrderStream`（daemon 自动接） |
+
+**client id 规则**：IB 每个 client id 只允许一个连接。写者（daemon、动资金的
+CLI 命令）固定用 `IB_CLIENT_ID`；只读视图命令自动用 `900 + pid % 100`
+（`IB_READONLY_CLIENT_ID_BASE`），互不冲突。只有下单的 client（或 Gateway
+配置的 master client）能改/撤自己的单——本项目里写者只有一个，天然满足。
+
+**边界**：
+- 只做美股（`Stock(sym, "SMART", "USD")`）；账户里的其它品种（期货等）在
+  `get_account()` 里以 localSymbol 出现，对账会报 `unknown_position`——
+  一账户一账本，别人在同一账户交易本来就该被看见
+- `reqCompletedOrders` / `reqExecutions` 只覆盖当天：daemon 跨日停机期间成交
+  的挂单，重启后数量可从 completed orders 补齐，但成交均价可能缺 → 表现为
+  cash drift，人工处理（正常运行时推送 + 5 秒轮询都在，不会走到这条）
+- `Inactive` 视为 rejected；IB 对每次撤单（含我方撤单）回 error 202，适配器
+  把 ib_async 的这条 ERROR 日志降为 INFO
+- ib_async 建模缺陷：改单被拒时它会把本地状态标成 Cancelled，适配器改单失败
+  后会强制 `reqAllOpenOrders` 刷新真实状态
+- 同一 IB 用户名同一时刻只能有一个 Gateway/TWS 会话（paper 与 live 是两套
+  用户名，可各开一个 Gateway 实例，端口默认就不同：4002 / 4001）
 
 ## 已知简化与边界（review 时重点看这里）
 
@@ -155,8 +207,10 @@ list_orders / get_account`。写一个基于 `ib_insync`（或官方 `ibapi`）�
 4. **成交靠轮询** `router.sync()`（默认 5 秒）。要更低延迟可接 Alpaca 的
    trade_updates WebSocket，回调里调 `sync()` 即可，记账逻辑不变（delta 记账，重复
    触发无副作用）。
-5. **手续费/借券费未建模**（Alpaca 股票零佣金，问题不大；SEC/TAF 卖出费会以微小
-   cash drift 形式出现，被 $0.01 容差吸收或由 `absorb_cash_drift` 处理）。
+5. **手续费按券商活动记账，不进成交均价**：Alpaca 零佣金（SEC/TAF 卖出费以微小
+   cash drift 出现，容差吸收或 `absorb_cash_drift`）；IB 每笔 commission 由
+   `attribute_cash_activities` 记到所属子账户的现金与 realized P&L，持仓 avg_cost
+   保持纯成交价（与 IB 自己含佣金的 avgCost 不同，对账只比数量不比成本）。
 6. **单进程写入**：ledger 假设 router 是唯一写者。多进程部署时策略必须走 REST，
    不能各自开 Router 实例。
 7. 洗售（wash sale）、PDT 规则、公司行动（拆股/分红再投资）不处理——拆股会表现为

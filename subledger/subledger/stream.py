@@ -1,4 +1,8 @@
-"""Trade-update streaming: push-based fill booking via Alpaca's websocket.
+"""Trade-update streaming: push-based fill booking.
+
+Alpaca (TradeUpdateStream): the trade_updates websocket.
+IB (IBOrderStream): order-status events the IBBroker adapter already receives
+over its gateway socket.
 
     stream = TradeUpdateStream(router, api_key=..., secret_key=..., paper=True)
     stream.add_listener(lambda event, state: ...)   # optional strategy hook
@@ -97,3 +101,44 @@ class TradeUpdateStream:
                 self._stream.stop()
             except Exception:
                 pass
+
+
+class IBOrderStream:
+    """Push-based booking for the IB adapter. IBBroker already normalizes the
+    gateway's order-status events into BrokerOrderState; this wires them into
+    Router.apply_stream_state and offers the same listener hook as
+    TradeUpdateStream (callback(event, state), event in
+    new / partial_fill / fill / canceled / rejected)."""
+
+    _EVENTS = {"filled": "fill", "partially_filled": "partial_fill",
+               "canceled": "canceled", "rejected": "rejected", "expired": "canceled"}
+
+    def __init__(self, router: Router, broker):
+        self.router = router
+        self.broker = broker
+        self._listeners: List[Callable] = []
+
+    def add_listener(self, callback: Callable) -> None:
+        self._listeners.append(callback)
+
+    def start(self) -> None:
+        self.broker.add_order_listener(self._on_state)
+        logger.info("ib order stream attached")
+
+    def stop(self) -> None:  # events stop with the adapter's connection
+        pass
+
+    def _on_state(self, state: BrokerOrderState) -> None:
+        try:
+            booked = self.router.apply_stream_state(state)
+        except Exception:
+            logger.exception("failed to book ib order event")
+            return
+        event = self._EVENTS.get(state.status, "new")
+        logger.info("ib order event %s %s %s filled=%s booked=%s",
+                    event, state.symbol, state.status, state.filled_qty, booked)
+        for callback in self._listeners:
+            try:
+                callback(event, state)
+            except Exception:
+                logger.exception("stream listener failed")

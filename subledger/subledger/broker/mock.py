@@ -70,17 +70,20 @@ class MockBroker(BrokerAdapter):
     def inject_external_cash(self, delta: Decimal) -> None:
         self.cash += delta
 
-    def inject_cash_activity(self, kind: str, amount: Decimal, symbol: str = "") -> str:
+    def inject_cash_activity(self, kind: str, amount: Decimal, symbol: str = "",
+                             order_client_id: str = "", at: str = "") -> str:
         """Simulate a dividend/fee posting: moves real cash and shows up in
-        get_cash_activities, like Alpaca's activities endpoint."""
+        get_cash_activities, like Alpaca's activities endpoint (or an IB
+        commission report when order_client_id names the order)."""
         activity_id = "act-{}".format(next(self._seq))
         self.cash += amount
         self.activities.append(BrokerCashActivity(
-            activity_id=activity_id, kind=kind, amount=amount, symbol=symbol))
+            activity_id=activity_id, kind=kind, amount=amount, symbol=symbol,
+            at=at, order_client_id=order_client_id))
         return activity_id
 
     def get_cash_activities(self, after: str = ""):
-        return list(self.activities)
+        return [a for a in self.activities if not after or not a.at or a.at >= after]
 
     def inject_external_order(self, symbol: str, qty: Decimal, client_order_id: str) -> str:
         """An order placed outside the router (e.g. via the broker's app)."""

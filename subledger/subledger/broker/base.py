@@ -35,6 +35,10 @@ class BrokerCashActivity:
     amount: Decimal           # signed: dividends positive, fees negative
     symbol: str = ""          # dividends carry the paying symbol; fees may not
     at: str = ""
+    # Venues that charge per order (IB commissions) know which order a fee
+    # belongs to; with the router's client id here the reconciler charges the
+    # owning sub-account instead of the unallocated pool.
+    order_client_id: str = ""
 
 
 @dataclass

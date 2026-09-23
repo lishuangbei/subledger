@@ -111,12 +111,19 @@ curl -X POST :8000/halt               # kill switch
 Fill sync and reconciliation run as background loops inside the API process
 (`SUBLEDGER_SYNC_INTERVAL`, `SUBLEDGER_RECONCILE_INTERVAL`).
 
-## Adding a broker (e.g. Interactive Brokers)
+## Brokers
 
-Implement five methods from `subledger/broker/base.py` —
-`submit_order`, `cancel_order`, `get_order`, `list_orders`, `get_account` —
-returning the normalized dataclasses. Router, ledger, and reconciler need no
-changes. For IB, the `orderRef` field carries the attribution id.
+- **Alpaca** — `subledger/broker/alpaca.py` (`pip install "subledger[alpaca]"`)
+- **Interactive Brokers** — `subledger/broker/ib.py` (`pip install "subledger[ib]"`,
+  needs a running TWS / IB Gateway; `SUBLEDGER_BROKER=ib IB_PORT=4002 ...`).
+  permId is the broker order id, `orderRef` carries the attribution id,
+  commissions are booked to the owning sub-account. Details in
+  `subledger/README.md`.
+
+Adding another venue means implementing five methods from
+`subledger/broker/base.py` — `submit_order`, `cancel_order`, `get_order`,
+`list_orders`, `get_account` — returning the normalized dataclasses. Router,
+ledger, and reconciler need no changes.
 
 ## What it deliberately does not do
 

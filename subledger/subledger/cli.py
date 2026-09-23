@@ -38,10 +38,16 @@ Commands
            trade history: orders with fills, newest first
   orders   [--sub ID] [--open] [--limit N]
            full order log incl. rejected/canceled and OCO legs
+  ops      reconcile | halt | resume | ack | absorb | attribute
+           operator actions (light writes, no writer lock — usable while a
+           daemon runs): run a reconcile now; kill switch on/off; acknowledge
+           the current foreign orders; absorb external cash drift into the
+           pool; book dividends/fees
 
 Stack comes from the environment (same as the REST layer):
-  SUBLEDGER_DB (default subledger.db), SUBLEDGER_BROKER=mock|alpaca,
-  ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER
+  SUBLEDGER_DB (default subledger.db), SUBLEDGER_BROKER=mock|alpaca|ib,
+  ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER,
+  IB_HOST / IB_PORT / IB_CLIENT_ID / IB_ACCOUNT / IB_PAPER / IB_MARKET_DATA_TYPE
 
 `--json` prints machine-readable output; without it, human tables.
 `--<subid>` (all digits) is shorthand for `--sub <subid>`, e.g. `positions --1001`.
@@ -251,10 +257,14 @@ def run(stack, argv) -> int:
     p_orders.add_argument("--open", action="store_true")
     p_orders.add_argument("--limit", type=int, default=50)
 
+    p_ops = sub.add_parser("ops")
+    p_ops.add_argument("action", choices=["reconcile", "halt", "resume", "ack", "absorb", "attribute"])
+    p_ops.add_argument("--note", default="")
+
     args = parser.parse_args(argv)
 
     try:
-        return _dispatch(args, ledger, broker, router)
+        return _dispatch(args, ledger, broker, router, reconciler)
     except (ValueError, KeyError) as exc:
         message = str(exc).strip("'")
         if args.json:
@@ -264,7 +274,9 @@ def run(stack, argv) -> int:
         return 1
 
 
-def _dispatch(args, ledger, broker, router) -> int:
+def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
+    if args.command == "ops":
+        return _ops(args, ledger, router, reconciler)
     if args.command == "accounts":
         if args.subcommand == "list":
             from .models import ZERO as _Z
@@ -705,6 +717,42 @@ def _dispatch(args, ledger, broker, router) -> int:
     return 0
 
 
+def _ops(args, ledger, router, reconciler) -> int:
+    """Operator actions: reads or single-statement light writes that coexist
+    with a running daemon (same posture as the trial's `ops`)."""
+    def report_dict(report):
+        return {"ok": report.ok, "at": report.at, "expected_cash": str(report.expected_cash),
+                "broker_cash": str(report.broker_cash),
+                "drifts": [vars(d) for d in report.drifts]}
+
+    if args.action == "reconcile":
+        report = reconciler.run()
+        _emit(report_dict(report), args.json, lambda _p: print(report.summary()))
+    elif args.action == "halt":
+        router.halt()
+        _emit({"halted": True}, args.json,
+              lambda _p: print("router HALTED — all new orders rejected until `ops resume`"))
+    elif args.action == "resume":
+        router.resume()
+        _emit({"halted": False}, args.json, lambda _p: print("router resumed"))
+    elif args.action == "ack":
+        report = reconciler.run()
+        acked = reconciler.acknowledge_foreign_orders(report, note=args.note or "ops ack")
+        after = reconciler.run()
+        payload = {"acknowledged": acked, "reconcile": report_dict(after)}
+        _emit(payload, args.json, lambda _p: print(
+            "acknowledged {} foreign order(s): {}\n{}".format(len(acked), acked, after.summary())))
+    elif args.action == "absorb":
+        delta = reconciler.absorb_cash_drift(note=args.note or "ops absorb")
+        _emit({"absorbed": str(delta)}, args.json,
+              lambda _p: print("absorbed cash drift: {}".format(delta)))
+    elif args.action == "attribute":
+        result = reconciler.attribute_cash_activities()
+        payload = {k: (str(v) if k == "total_amount" else v) for k, v in result.items()}
+        _emit(payload, args.json, lambda _p: print("attributed: {}".format(payload)))
+    return 0
+
+
 # Returns colouring: green/red by sign, intensity by magnitude on a PER-WINDOW
 # scale (1% in a day is news; 1% over a year is noise). White background marks
 # a percentage that cannot be trusted — cash moved inside the window or the
@@ -792,7 +840,7 @@ def _build_stack_from_env():
     words = [a for a in sys.argv[1:] if not a.startswith("-")]
     cmd = words[0] if words else ""
     sub = words[1] if len(words) > 1 else ""
-    if cmd in _VIEW_COMMANDS or (cmd == "accounts" and sub in ("list", "show")):
+    if cmd in _VIEW_COMMANDS or cmd == "ops" or (cmd == "accounts" and sub in ("list", "show")):
         os.environ.setdefault("SUBLEDGER_READONLY", "1")
     return _build_stack()
 

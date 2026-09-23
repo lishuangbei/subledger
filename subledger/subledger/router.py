@@ -126,6 +126,8 @@ class Router:
                 raise ValueError("ledger already initialized; adopt refused")
             cash = self.broker.get_account().cash
             self.ledger.set_unallocated_cash(cash)
+            import datetime as _dt
+            self.ledger.set_inception_at(_dt.datetime.now(_dt.timezone.utc).isoformat())
             return cash
 
     def create_sub_account(self, acct: SubAccount, initial_allocation: Decimal = ZERO) -> SubAccount:

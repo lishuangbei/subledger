@@ -208,6 +208,12 @@ class Ledger:
                     self._conn.execute(
                         "ALTER TABLE sub_accounts ADD COLUMN {} {}".format(column, decl)
                     )
+            existing_master = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(master)").fetchall()
+            }
+            if "inception_at" not in existing_master:
+                self._conn.execute("ALTER TABLE master ADD COLUMN inception_at TEXT")
             self._conn.commit()
 
     def backup(self, path: str) -> None:
@@ -259,6 +265,18 @@ class Ledger:
             self._conn.execute(
                 "UPDATE master SET unallocated_cash=? WHERE id=1", (str(value),)
             )
+            self._conn.commit()
+
+    def inception_at(self) -> Optional[str]:
+        """ISO-8601 UTC instant the ledger adopted the real account's cash.
+        Broker cash activities dated before it were already inside the
+        adopted balance and must never be booked again."""
+        row = self._conn.execute("SELECT inception_at FROM master WHERE id=1").fetchone()
+        return row["inception_at"] or None
+
+    def set_inception_at(self, at: str) -> None:
+        with self._lock:
+            self._conn.execute("UPDATE master SET inception_at=? WHERE id=1", (at,))
             self._conn.commit()
 
     def is_halted(self) -> bool:
