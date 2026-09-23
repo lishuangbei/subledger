@@ -98,7 +98,8 @@ def _build_stack():
     SUBLEDGER_BROKER=mock|alpaca|ib
       alpaca: ALPACA_API_KEY / ALPACA_SECRET_KEY / ALPACA_PAPER
       ib:     IB_HOST (127.0.0.1) / IB_PORT (4002) / IB_CLIENT_ID (11) /
-              IB_ACCOUNT (optional) / IB_PAPER (true) / IB_MARKET_DATA_TYPE (3)
+              IB_ACCOUNT (optional) / IB_PAPER (true) / IB_MARKET_DATA_TYPE (3) /
+              IB_CASH_CURRENCY (USD; "" = base-currency total)
     """
     readonly = os.environ.get("SUBLEDGER_READONLY", "").lower() in ("1", "true", "yes")
     ledger = Ledger(os.environ.get("SUBLEDGER_DB", "subledger.db"),
@@ -127,6 +128,7 @@ def _build_stack():
             account=os.environ.get("IB_ACCOUNT", ""),
             paper=os.environ.get("IB_PAPER", "true").lower() != "false",
             market_data_type=int(os.environ.get("IB_MARKET_DATA_TYPE", "3")),
+            cash_currency=os.environ.get("IB_CASH_CURRENCY", "USD"),
             readonly=readonly,
         )
     else:

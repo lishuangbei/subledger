@@ -157,6 +157,8 @@ IB_HOST=127.0.0.1  IB_PORT=4002  IB_CLIENT_ID=11   # 写者用的 client id
 IB_ACCOUNT=        # 留空 = 会话的第一个账户；FA 多账户时填账户号
 IB_PAPER=true      # 硬守卫：true 要求账户号 D 开头(paper)，false 要求 U 开头(真金)
 IB_MARKET_DATA_TYPE=3   # 1 实时(需 API 行情订阅) 3 延迟(默认) 4 延迟冻结
+IB_CASH_CURRENCY=USD    # 账本币种:只取这一种货币的现金余额(多币种账户的
+                        # TotalCashValue 是按汇率折算的总额,会随汇率每几分钟漂移)
 ```
 
 | subledger 概念 | IB 映射 |
@@ -167,6 +169,7 @@ IB_MARKET_DATA_TYPE=3   # 1 实时(需 API 行情订阅) 3 延迟(默认) 4 延�
 | bracket / OTO | 父单 + 附属子单（`parentId` + transmit 链），一腿成交另一腿由 IB 撤 |
 | replace | **真改单**（同 permId，返回的 id 不变；orderRef 不换） |
 | TIF `cls` | MOC / LOC 订单类型；`opg` → tif OPG |
+| `extended_hours` | outsideRth（盘前 04:00 起、盘后到 20:00 ET）；**夜盘**（20:00–03:50 ET）开着时，简单 DAY 限价单改路由到 IB 的 OVERNIGHT 场所——SPY/QQQ 这类标的近乎全天可交易。直连场所要求 Gateway 勾选 API → Precautions → *Bypass Order Precautions for API Orders*（IBC：`BypassOrderPrecautions=yes`），否则 IB 以 10329 拒单；SMART + OVT/OND 时效虽被接受，实测仍等到 04:00 ET 才送交易所 |
 | notional | 不支持（整股账本策略下由 `get_asset(fractionable=False)` 在 router 层拒绝） |
 | clock | `SPY` 合约的 liquidHours（按日缓存），语义同 Alpaca |
 | marks | `reqTickers`（默认延迟行情）；拿不到的用持仓市值价兜底 |

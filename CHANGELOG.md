@@ -10,6 +10,15 @@
   liquidHours 时钟、commission → fee 活动(带 orderRef)。私有事件循环线程,
   同步线程安全;断连自动重连(指数退避);`IB_PAPER` 账户号前缀硬守卫;
   只读视图 client id 按 pid 派生,不与写者冲突
+- `extended_hours` 在 IB 上覆盖夜盘:OVERNIGHT 会话(20:00–03:50 ET)开着时,
+  简单 DAY 限价单路由到 OVERNIGHT 场所(会话时段取自该场所的合约详情),否则
+  SMART + outsideRth。直连场所需 Gateway 的 API 预防性设置放行
+  (Bypass Order Precautions for API Orders / IBC `BypassOrderPrecautions=yes`),
+  否则 10329 拒单——router 记为 rejected,预留释放,无漂移(实测);
+  SMART + OVT/OND 时效 IB 接受但实测仍延到 04:00 ET 才送交易所
+- 现金按账本币种取值(`IB_CASH_CURRENCY`,默认 USD):IB 多币种账户的
+  TotalCashValue 是折算总额,随汇率漂移(实测:paper 账户里的 HKD 余额让对账每
+  几分钟红一次);改取该币种的 CashBalance / NetLiquidationByCurrency
 - **`BrokerCashActivity.order_client_id`** + Reconciler:带 client id 的
   fee 记到所属子账户(cash 与 realized P&L),不再进池子;mock
   `inject_cash_activity(order_client_id=)`

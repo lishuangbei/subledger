@@ -30,6 +30,14 @@ Reconciler.attribute_cash_activities).
 Market data: paper accounts usually have no real-time API entitlement;
 last_prices() asks for the configured market-data type (3 = delayed, the
 default) and falls back to portfolio marks for held symbols.
+
+Extended hours: `extended_hours=True` sets outsideRth (pre-market 04:00 and
+after-hours to 20:00 ET). IB additionally runs an OVERNIGHT session
+(20:00-03:50 ET) for US stocks/ETFs on its own venue; a simple DAY limit
+order placed with extended_hours while that session is open is routed to
+exchange OVERNIGHT instead of SMART, so "extended hours" means "whichever
+session is trading right now" — nearly round the clock for SPY/QQQ-class
+names. Overnight orders expire at 03:50 ET like any DAY order there.
 """
 
 from __future__ import annotations
@@ -346,12 +354,18 @@ class IBBroker(BrokerAdapter):
                  account: str = "", paper: bool = True, market_data_type: int = 3,
                  readonly: bool = False, connect_timeout: float = 10.0,
                  call_timeout: float = 30.0, ack_timeout: float = 10.0,
-                 clock_symbol: str = "SPY", ib_factory: Optional[Callable] = None):
+                 clock_symbol: str = "SPY", cash_currency: str = "USD",
+                 ib_factory: Optional[Callable] = None):
         """paper: hard guard — the connected account's code must look like a
         paper account (D...) when True and like a live one when False;
         otherwise every call fails closed (wrong gateway / wrong port).
         readonly: a viewer connection (CLI views): the client id is assumed
         unique per process and no order fetch happens at connect.
+        cash_currency: the ledger's currency. IB accounts can hold several
+        currencies and its TotalCashValue is the base-currency conversion of
+        all of them, which drifts with FX every few minutes; the adapter
+        reports the cash balance in this one currency instead (other
+        currencies stay outside the ledger). Empty string = TotalCashValue.
         ib_factory: test seam, returns an object with ib_async.IB's surface."""
         self._host = host
         self._port = int(port)
@@ -365,6 +379,7 @@ class IBBroker(BrokerAdapter):
         self._call_timeout = call_timeout
         self._ack_timeout = ack_timeout
         self._clock_symbol = clock_symbol
+        self._cash_currency = (cash_currency or "").upper()
         self._ib_factory = ib_factory
         self._ib = None
         self._fatal: Optional[str] = None
@@ -375,6 +390,7 @@ class IBBroker(BrokerAdapter):
         self._details: Dict[str, Any] = {}
         self._asset_cache: Dict[str, BrokerAsset] = {}
         self._hours: Optional[Tuple[str, str, str]] = None
+        self._overnight: Dict[str, tuple] = {}
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
         self._listeners: List[Callable[[BrokerOrderState], None]] = []
@@ -596,6 +612,33 @@ class IBBroker(BrokerAdapter):
         self._details[key] = details[0]
         return details[0].contract
 
+    async def _overnight_contract(self, symbol: str):
+        """The OVERNIGHT-venue contract for `symbol` if IB lists one and its
+        session is open right now; else None. Details are cached per day."""
+        key = symbol.upper()
+        today = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        cached = self._overnight.get(key)
+        if cached is None or cached[0] != today:
+            from ib_async import Stock
+
+            try:
+                details = await asyncio.wait_for(
+                    self._ib.reqContractDetailsAsync(Stock(_ib_symbol(key), "OVERNIGHT", "USD")),
+                    self._call_timeout)
+            except Exception:
+                details = []
+            if details:
+                d = details[0]
+                cached = (today, d.contract, d.tradingHours or "", d.timeZoneId or "US/Eastern")
+            else:
+                cached = (today, None, "", "")
+            self._overnight[key] = cached
+        _day, contract, hours, tz = cached
+        if contract is None:
+            return None
+        clock = parse_ib_hours(hours, tz, _dt.datetime.now(_dt.timezone.utc))
+        return contract if clock.is_open else None
+
     # -- BrokerAdapter ----------------------------------------------------
 
     def describe(self) -> dict:
@@ -608,6 +651,12 @@ class IBBroker(BrokerAdapter):
     async def _submit(self, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:
         ib = await self._connect()
         contract = await self._contract(req.symbol)
+        if (req.extended_hours and req.order_class == OrderClass.SIMPLE
+                and req.order_type == OrderType.LIMIT and req.time_in_force == TimeInForce.DAY):
+            overnight = await self._overnight_contract(req.symbol)
+            if overnight is not None:
+                contract = overnight
+                logger.info("ib: %s routed to the OVERNIGHT session", req.symbol)
         plan = build_order_plan(req, client_order_id, account=self._account)
         orders = [plan.parent] + [order for order, _ in plan.legs]
         for order in orders:
@@ -852,6 +901,17 @@ class IBBroker(BrokerAdapter):
 
         cash = pick("TotalCashValue")
         equity = pick("NetLiquidation")
+        if self._cash_currency:
+            by_ccy = {}
+            for v in ib.accountValues(self._account):
+                if v.currency == self._cash_currency and v.tag in ("CashBalance", "NetLiquidationByCurrency"):
+                    try:
+                        by_ccy[v.tag] = Decimal(str(v.value))
+                    except Exception:
+                        continue
+            if "CashBalance" in by_ccy:
+                cash = by_ccy["CashBalance"]
+                equity = by_ccy.get("NetLiquidationByCurrency", equity)
         if cash is None or equity is None:
             raise BrokerError("ib: account summary incomplete (TotalCashValue / NetLiquidation)")
         marks: Dict[int, float] = {}

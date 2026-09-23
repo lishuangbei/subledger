@@ -69,12 +69,14 @@ class FakeIB:
         self.market_data_type = None
         self.price = 100.0
         self.summary = {"TotalCashValue": "50000", "NetLiquidation": "61000", "BuyingPower": "200000"}
+        self.values = {}                # (tag, currency) -> value, for accountValues()
         self._trades = []
         self._fills = []
         self._positions = []
         self._portfolio = []
         self.tickers = {}
         self.unknown = set()
+        self.overnight_hours = ""       # set to a window covering "now" to open the overnight venue
         self.modify_error = None
         self.cancelled = []
         self.placed = []
@@ -117,6 +119,11 @@ class FakeIB:
 
         return [AccountValue(account, tag, value, "USD", "") for tag, value in self.summary.items()]
 
+    def accountValues(self, account=""):
+        from ib_async import AccountValue
+
+        return [AccountValue(account, tag, value, ccy, "") for (tag, ccy), value in self.values.items()]
+
     async def reqAllOpenOrdersAsync(self):
         return [t for t in self._trades if t.orderStatus.status not in ("Filled", "Cancelled", "ApiCancelled", "Inactive")]
 
@@ -132,6 +139,12 @@ class FakeIB:
 
         if contract.symbol in self.unknown:
             return []
+        if contract.exchange == "OVERNIGHT":
+            if not self.overnight_hours:
+                return []
+            c = self.contract_for(contract.symbol)
+            c.exchange = "OVERNIGHT"
+            return [ContractDetails(contract=c, tradingHours=self.overnight_hours, timeZoneId="US/Eastern")]
         return [ContractDetails(contract=self.contract_for(contract.symbol), liquidHours=HOURS,
                                 tradingHours=HOURS, timeZoneId="US/Eastern")]
 
@@ -361,6 +374,23 @@ class IBBrokerTests(unittest.TestCase):
         state = self.broker.get_order("7001")
         self.assertEqual((state.status, state.client_order_id, state.symbol), ("open", "sl.alpha.abc", "AAPL"))
 
+    def test_extended_hours_routes_to_overnight_when_open(self):
+        req = order(order_type=OrderType.LIMIT, limit_price=D("95"), extended_hours=True)
+        self.broker.submit_order(req, "sl.alpha.x1")
+        self.assertEqual(self.fake.placed[-1].contract.exchange, "SMART")   # venue closed
+        self.assertTrue(self.fake.placed[-1].order.outsideRth)
+        now = dt.datetime.now(dt.timezone.utc).astimezone(__import__("zoneinfo").ZoneInfo("America/New_York"))
+        start = (now - dt.timedelta(hours=1)).strftime("%Y%m%d:%H%M")
+        end = (now + dt.timedelta(hours=1)).strftime("%Y%m%d:%H%M")
+        self.fake.overnight_hours = "{}-{}".format(start, end)
+        self.broker._overnight.clear()
+        self.broker.submit_order(req, "sl.alpha.x2")
+        self.assertEqual(self.fake.placed[-1].contract.exchange, "OVERNIGHT")
+        # not for GTC / non-limit / exit groups
+        self.broker.submit_order(order(order_type=OrderType.LIMIT, limit_price=D("95"), extended_hours=True,
+                                       time_in_force=TimeInForce.GTC), "sl.alpha.x3")
+        self.assertEqual(self.fake.placed[-1].contract.exchange, "SMART")
+
     def test_market_fill_reported(self):
         self.fake.price = 123.456789
         result = self.broker.submit_order(order(qty="3"), "sl.alpha.m1")
@@ -512,6 +542,21 @@ class IBBrokerTests(unittest.TestCase):
                          (D("50000"), D("61000"), D("200000"), "DU123"))
         self.assertEqual([(p.symbol, p.qty, p.avg_entry_price, p.current_price) for p in state.positions],
                          [("AAPL", D("10"), D("150.5"), D("160.25")), ("MNQZ6", D("2"), D("31000"), D("31000"))])
+
+    def test_cash_scoped_to_ledger_currency(self):
+        # TotalCashValue is the base-currency total of every currency held
+        # (drifts with FX); the ledger only wants the USD balance.
+        self.fake.values = {("CashBalance", "BASE"): "514805.63", ("CashBalance", "HKD"): "122185.23",
+                            ("CashBalance", "USD"): "499227.70",
+                            ("NetLiquidationByCurrency", "USD"): "499827.45"}
+        state = self.broker.get_account()
+        self.assertEqual((state.cash, state.equity), (D("499227.70"), D("499827.45")))
+        from subledger.broker.ib import IBBroker
+        total = IBBroker(client_id=8, paper=True, ib_factory=lambda: self.fake, call_timeout=5, cash_currency="")
+        try:
+            self.assertEqual(total.get_account().cash, D("50000"))
+        finally:
+            total.close()
 
     def test_paper_guard(self):
         from subledger.broker.ib import IBBroker
