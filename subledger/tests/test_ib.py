@@ -596,7 +596,7 @@ class IBBrokerTests(unittest.TestCase):
             broker.close()
 
     def test_cash_activities_are_commissions_with_attribution(self):
-        self.fake.add_fill("AAPL", 7001, 10.0, 100.0, commission=1.05, order_ref="sl.alpha.abc", exec_id="e1")
+        self.fake.add_fill("AAPL", 7001, 10.0, 100.0, commission=1.050003, order_ref="sl.alpha.abc", exec_id="e1")
         self.fake.add_fill("AAPL", 7002, 10.0, 100.0, commission=0.0, order_ref="sl.alpha.zero", exec_id="e2")
         activities = self.broker.get_cash_activities()
         self.assertEqual(len(activities), 1)

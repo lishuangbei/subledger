@@ -1057,7 +1057,9 @@ class IBBroker(BrokerAdapter):
             out.append(BrokerCashActivity(
                 activity_id="ib-comm-{}".format(execution.execId),
                 kind="fee",
-                amount=-_dec(commission),
+                # IB books cash in cents; its commission floats carry noise
+                # (1.000003) that would otherwise accumulate as sub-cent drift.
+                amount=-_dec(commission).quantize(Decimal("0.01")),
                 symbol=_symbol_of(fill.contract),
                 at=when.isoformat() if isinstance(when, _dt.datetime) else "",
                 order_client_id=str(getattr(execution, "orderRef", "") or ""),
