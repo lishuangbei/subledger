@@ -50,6 +50,7 @@ import math
 import queue
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -102,6 +103,7 @@ _NON_REJECT_CODES = frozenset({105, 110, 165, 202, 321, 329, 399, 404, 434, 492,
 
 _UNSET = 1e300        # ib_async's UNSET_DOUBLE sentinel is ~1.8e308
 OVERNIGHT_RETRY_S = 3600   # after a direct-routing refusal, retry the overnight venue this often
+MARKET_DATA_LINES = 90     # streaming quote lines kept for last_prices (IB default quota is 100)
 # "This order will be directly routed to X ... Restriction is specified in
 # Precautionary Settings": 10311 (generic venue) / 10329 (OVERNIGHT).
 _DIRECT_ROUTING_CODES = frozenset({10311, 10329})
@@ -151,6 +153,17 @@ def _symbol_of(contract) -> str:
     if getattr(contract, "secType", "") == "STK":
         return str(getattr(contract, "symbol", "") or "").replace(" ", ".")
     return str(getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "") or "")
+
+
+def _ticker_price(ticker) -> float:
+    """Best available price on a streaming/snapshot ticker: last inside the
+    quote, else midpoint, else last, else close."""
+    for candidate in (getattr(ticker, "marketPrice", lambda: 0.0)(), getattr(ticker, "last", 0.0),
+                      getattr(ticker, "close", 0.0)):
+        price = _num(candidate)
+        if price > 0:
+            return price
+    return 0.0
 
 
 def _permid(trade) -> int:
@@ -399,6 +412,8 @@ class IBBroker(BrokerAdapter):
         self._asset_cache: Dict[str, BrokerAsset] = {}
         self._hours: Optional[Tuple[str, str, str]] = None
         self._overnight: Dict[str, tuple] = {}
+        self._mkt: "OrderedDict[str, Any]" = OrderedDict()   # symbol -> streaming Ticker (LRU)
+        self._tick_wait = 3.0                                # first-tick wait for new lines
         self._overnight_blocked_until = 0.0     # monotonic; direct routing retried after it
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
@@ -488,6 +503,7 @@ class IBBroker(BrokerAdapter):
         return self._ib
 
     def _on_disconnected(self, *_args) -> None:
+        self._mkt.clear()          # streaming lines die with the session; re-subscribe lazily
         if self._closing:
             return
         logger.warning("ib gateway %s:%s disconnected; reconnecting on next call", self._host, self._port)
@@ -979,9 +995,12 @@ class IBBroker(BrokerAdapter):
         return marks
 
     async def _last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
+        """Marks from STREAMING market-data lines that stay subscribed: a
+        snapshot request (reqTickers) waits ~10-13s per batch on delayed data,
+        which starves batch callers. New symbols cost one short wait for the
+        first tick; symbols seen before answer instantly. At most
+        MARKET_DATA_LINES lines are kept (LRU), within IB's default quota."""
         ib = await self._connect()
-        # Qualify unknown symbols concurrently (bounded): one round trip each
-        # done serially took ~0.9s/symbol, which starves batch callers.
         semaphore = asyncio.Semaphore(20)
 
         async def qualify(symbol: str):
@@ -997,17 +1016,31 @@ class IBBroker(BrokerAdapter):
         marks: Dict[str, Decimal] = {}
         if not contracts:
             return marks
-        tickers = await asyncio.wait_for(ib.reqTickersAsync(*contracts.values()), self._call_timeout)
-        by_conid = {t.contract.conId: t for t in tickers}
+        fresh = []
         for symbol, contract in contracts.items():
-            ticker = by_conid.get(contract.conId)
+            ticker = self._mkt.get(symbol)
             if ticker is None:
-                continue
-            for candidate in (ticker.marketPrice(), ticker.last, ticker.close):
-                price = _num(candidate)
-                if price > 0:
-                    marks[symbol] = _dec(price)
+                while len(self._mkt) >= MARKET_DATA_LINES:
+                    victim, old = self._mkt.popitem(last=False)
+                    try:
+                        ib.cancelMktData(old.contract)
+                    except Exception:  # pragma: no cover
+                        pass
+                ticker = ib.reqMktData(contract, "", False, False)
+                self._mkt[symbol] = ticker
+                fresh.append(symbol)
+            else:
+                self._mkt.move_to_end(symbol)
+        if fresh:
+            deadline = time.monotonic() + self._tick_wait
+            while time.monotonic() < deadline:
+                if all(_ticker_price(self._mkt[s]) > 0 for s in fresh):
                     break
+                await asyncio.sleep(0.1)
+        for symbol in contracts:
+            price = _ticker_price(self._mkt[symbol])
+            if price > 0:
+                marks[symbol] = _dec(price)
         return marks
 
     def get_clock(self) -> BrokerClock:

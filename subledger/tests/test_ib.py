@@ -149,6 +149,18 @@ class FakeIB:
         return [ContractDetails(contract=self.contract_for(contract.symbol), liquidHours=HOURS,
                                 tradingHours=HOURS, timeZoneId="US/Eastern")]
 
+    def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
+        from ib_async import Ticker
+
+        ticker = Ticker(contract=contract)
+        for name, value in self.tickers.get(contract.symbol, {}).items():
+            setattr(ticker, name, value)
+        self.subscribed = getattr(self, "subscribed", []) + [contract.symbol]
+        return ticker
+
+    def cancelMktData(self, contract):
+        self.cancelled_lines = getattr(self, "cancelled_lines", []) + [contract.symbol]
+
     async def reqTickersAsync(self, *contracts):
         from ib_async import Ticker
 
@@ -616,8 +628,12 @@ class IBBrokerTests(unittest.TestCase):
                              "MSFT": {"close": 300.0},
                              "NOPE": {}}
         self.fake._positions.append(Position("DU123", self.fake.contract_for("QQQ"), 1.0, 700.0))
+        self.broker._tick_wait = 0.2
         marks = self.broker.last_prices(["AAPL", "MSFT", "NOPE", "QQQ"])
         self.assertEqual(marks, {"AAPL": D("101"), "MSFT": D("300"), "QQQ": D("700")})
+        # lines stay subscribed: the second call reuses them
+        self.broker.last_prices(["AAPL"])
+        self.assertEqual(self.fake.subscribed.count("AAPL"), 1)
 
     def test_clock_and_asset(self):
         clock = self.broker.get_clock()
