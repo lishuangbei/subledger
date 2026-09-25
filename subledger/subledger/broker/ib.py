@@ -980,11 +980,20 @@ class IBBroker(BrokerAdapter):
 
     async def _last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
         ib = await self._connect()
-        contracts = {}
-        for symbol in symbols:
-            contract = await self._contract(symbol, strict=False)
-            if contract is not None:
-                contracts[symbol] = contract
+        # Qualify unknown symbols concurrently (bounded): one round trip each
+        # done serially took ~0.9s/symbol, which starves batch callers.
+        semaphore = asyncio.Semaphore(20)
+
+        async def qualify(symbol: str):
+            async with semaphore:
+                try:
+                    return symbol, await self._contract(symbol, strict=False)
+                except Exception as exc:
+                    logger.warning("ib: contract lookup failed for %s: %s", symbol, exc)
+                    return symbol, None
+
+        pairs = await asyncio.gather(*(qualify(s) for s in symbols))
+        contracts = {symbol: contract for symbol, contract in pairs if contract is not None}
         marks: Dict[str, Decimal] = {}
         if not contracts:
             return marks
