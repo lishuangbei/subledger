@@ -19,6 +19,9 @@
 - 现金按账本币种取值(`IB_CASH_CURRENCY`,默认 USD):IB 多币种账户的
   TotalCashValue 是折算总额,随汇率漂移(实测:paper 账户里的 HKD 余额让对账每
   几分钟红一次);改取该币种的 CashBalance / NetLiquidationByCurrency
+- marks:改用**常驻行情线**(reqMktData 流式,LRU 最多 90 条,断线后惰性重订),
+  合约查询并发化——此前 reqTickers 快照在延迟数据下每批 10–13 秒,executor 逐票
+  取价 10 秒超时;现在首次约 3 秒、之后毫秒级
 - **`BrokerCashActivity.order_client_id`** + Reconciler:带 client id 的
   fee 记到所属子账户(cash 与 realized P&L),不再进池子;mock
   `inject_cash_activity(order_client_id=)`
