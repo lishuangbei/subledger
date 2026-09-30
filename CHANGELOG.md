@@ -1,5 +1,22 @@
 # Changelog
 
+## unreleased — 2026-09-30:现金按结算精度记账 + 小额现金偏差可不急停
+
+背景:liveAlpa 2026-09-25 06:35 PT 被 halt_on_drift 急停,账本比券商多 $0.0135 =
+成交尾数 $0.0035(5 x 763.3153 记 3816.5765,Alpaca 扣 3816.58)+ 一笔成交当时就从
+现金扣掉、收盘后才出现在活动记录里的 $0.01 费用(CAT 类)。急停是粘性的,5 天无人解除,
+期间 Alpaca 撤掉了 4757 的 META OCO,执行器两次重挂保护都被急停拒绝。
+
+- **`BrokerAdapter.cash_precision`**:Alpaca / IB 为 `0.01`。Router 把每张订单的
+  **累计**成交额按该精度(ROUND_HALF_UP)取整后记差额,部分成交不累积舍入误差;
+  现金、成本价、已实现盈亏同口径。mock 默认 None(精确),既有测试不变
+- **`Reconciler(halt_min_cash_drift=...)` / `SUBLEDGER_HALT_MIN_CASH_DRIFT`**(默认不设 =
+  旧行为):只有现金一种偏差且金额小于阈值时,照常报告(ok=False)但不急停;任何持仓/
+  外来单偏差、或现金偏差达到阈值,照旧急停。用于吸收"费用当时扣、活动晚发布"造成的
+  分级别瞬时偏差
+- 已有账本里的历史尾数不追溯(在容差内)
+- 162 tests(+7:结算取整、部分成交累计取整、往返盈亏=现金、09-25 事故复现/修复、阈值)
+
 ## unreleased — 2026-09-22:Interactive Brokers 适配器
 
 - **`broker/ib.py` — `IBBroker`**(ib_async ≥ 2.0,`pip install "subledger[ib]"`,

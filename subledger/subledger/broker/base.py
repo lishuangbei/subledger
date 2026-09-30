@@ -100,6 +100,11 @@ class BrokerAdapter(abc.ABC):
     """Minimal surface a venue must provide."""
 
     name: str = "abstract"
+    # Smallest unit the venue moves cash in (Decimal("0.01") for US brokers).
+    # When set, the router books each order's cash at this precision so the
+    # ledger never accumulates sub-cent residue the broker doesn't have.
+    # None = book the exact qty * price product (simulators, tests).
+    cash_precision: Optional[Decimal] = None
 
     @abc.abstractmethod
     def submit_order(self, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:

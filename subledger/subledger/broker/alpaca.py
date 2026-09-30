@@ -83,6 +83,7 @@ _STATUS_MAP = {
 
 class AlpacaBroker(BrokerAdapter):
     name = "alpaca"
+    cash_precision = Decimal("0.01")
 
     def __init__(self, api_key: str, secret_key: str, paper: bool = True,
                  retries: int = 3, retry_base_delay: float = 0.5):

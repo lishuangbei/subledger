@@ -11,6 +11,11 @@ Checks, in order:
 Run it on a timer (see cli.py / api.py) — every 5–15 minutes is plenty.
 `halt_on_drift=True` flips the router's kill switch when a drift is found,
 so no new orders go out against a ledger that no longer matches reality.
+`halt_min_cash_drift` (optional) keeps small CASH-only drifts from halting:
+brokers charge per-trade regulatory fees (CAT/TAF, a cent or two) to cash at
+execution but publish the activity hours later, so every fill opens a
+transient cent-level gap. Such drifts are still reported (ok=False); any
+position/order drift, or a cash gap at or above the threshold, still halts.
 """
 
 from __future__ import annotations
@@ -36,12 +41,14 @@ class Reconciler:
         cash_tolerance: Decimal = Decimal("0.01"),
         qty_tolerance: Decimal = Decimal("0.000001"),
         halt_on_drift: bool = False,
+        halt_min_cash_drift: Optional[Decimal] = None,
     ):
         self.ledger = ledger
         self.broker = broker
         self.cash_tolerance = cash_tolerance
         self.qty_tolerance = qty_tolerance
         self.halt_on_drift = halt_on_drift
+        self.halt_min_cash_drift = halt_min_cash_drift
 
     def run(self) -> ReconciliationReport:
         at = _dt.datetime.now(_dt.timezone.utc).isoformat()
@@ -153,10 +160,23 @@ class Reconciler:
             logger.info(report.summary())
         else:
             logger.error(report.summary())
-            if self.halt_on_drift:
+            if self.halt_on_drift and self._warrants_halt(report):
                 self.ledger.set_halted(True)
                 logger.error("router halted due to reconciliation drift")
+            elif self.halt_on_drift:
+                logger.warning("cash drift %s is below the halt threshold %s: reported, not halted",
+                               report.expected_cash - report.broker_cash, self.halt_min_cash_drift)
         return report
+
+    def _warrants_halt(self, report: ReconciliationReport) -> bool:
+        if self.halt_min_cash_drift is None:
+            return True
+        for drift in report.drifts:
+            if drift.kind != "cash":
+                return True
+            if abs(report.expected_cash - report.broker_cash) >= self.halt_min_cash_drift:
+                return True
+        return False
 
     def attribute_cash_activities(self, after: str = "") -> dict:
         """Book non-trade cash movements (dividends/fees) into the ledger so

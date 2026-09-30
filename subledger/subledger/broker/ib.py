@@ -370,6 +370,7 @@ def _quiet_cancel_echo() -> None:
 
 class IBBroker(BrokerAdapter):
     name = "ib"
+    cash_precision = Decimal("0.01")
 
     def __init__(self, host: str = "127.0.0.1", port: int = 4002, client_id: int = 1,
                  account: str = "", paper: bool = True, market_data_type: int = 3,

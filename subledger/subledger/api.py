@@ -144,6 +144,10 @@ def _build_stack():
         ledger,
         broker,
         halt_on_drift=os.environ.get("SUBLEDGER_HALT_ON_DRIFT", "false").lower() == "true",
+        halt_min_cash_drift=(
+            Decimal(os.environ["SUBLEDGER_HALT_MIN_CASH_DRIFT"])
+            if os.environ.get("SUBLEDGER_HALT_MIN_CASH_DRIFT") else None
+        ),
     )
     return ledger, broker, router, reconciler
 

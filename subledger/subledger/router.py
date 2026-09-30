@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 import threading
 import uuid
-from decimal import Decimal
+from decimal import ROUND_HALF_UP, Decimal
 from typing import List, Optional
 
 from . import risk
@@ -677,6 +677,16 @@ class Router:
             )
         )
 
+    def _settled(self, amount: Decimal) -> Decimal:
+        """An order's cumulative notional as the broker settles it. Brokers
+        move cash in cents; booking the raw qty*avg product leaves sub-cent
+        residue per order that adds up to reconciliation drift (liveAlpa,
+        2026-09-25: 5 x 763.3153 booked 3816.5765, Alpaca debited 3816.58)."""
+        precision = getattr(self.broker, "cash_precision", None)
+        if precision is None:
+            return amount
+        return amount.quantize(precision, rounding=ROUND_HALF_UP)
+
     def _gross_exposure(self, sub_id: str) -> Decimal:
         """Current long market value of one sub-account (equity-based margin)."""
         return sum(
@@ -726,9 +736,12 @@ class Router:
         delta_qty = state.filled_qty - order.filled_qty
         if delta_qty > ZERO:
             # Cumulative avg -> notional delta for exactly this increment.
+            # Cash moves as the venue settles it (cents): round the order's
+            # CUMULATIVE notional and book the difference, so partial fills
+            # never accumulate rounding error.
             delta_notional = (
-                state.filled_qty * state.filled_avg_price
-                - order.filled_qty * order.filled_avg_price
+                self._settled(state.filled_qty * state.filled_avg_price)
+                - self._settled(order.filled_qty * order.filled_avg_price)
             )
             fill_price = delta_notional / delta_qty
             if group is not None:
