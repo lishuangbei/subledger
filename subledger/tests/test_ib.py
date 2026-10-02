@@ -667,6 +667,20 @@ class IBBrokerTests(unittest.TestCase):
             self.assertEqual(marks["S0"], D("100"))
             self.assertLessEqual(len(self.broker._mkt), 3)      # line budget respected
 
+    def test_repeat_call_opens_only_the_lines_it_must(self):
+        # 4 symbols, 3 lines: a repeat call reads the 3 streaming lines first
+        # and opens one line, instead of churning two
+        import subledger.broker.ib as ibmod
+
+        symbols = ["S0", "S1", "S2", "S3"]
+        self.fake.tickers = {s: {"last": 10.0} for s in symbols}
+        self.broker._tick_wait = 0.2
+        with mock.patch.object(ibmod, "MARKET_DATA_LINES", 3):
+            self.assertEqual(len(self.broker.last_prices(symbols)), 4)
+            before = len(self.fake.subscribed)
+            self.assertEqual(len(self.broker.last_prices(symbols)), 4)
+            self.assertEqual(len(self.fake.subscribed) - before, 1)
+
     def test_resubscribed_line_waits_for_a_new_tick(self):
         # ib_async hands a re-subscribed contract its old Ticker back, still
         # holding the price from when the line was dropped (could be hours):

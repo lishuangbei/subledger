@@ -1032,6 +1032,7 @@ class IBBroker(BrokerAdapter):
                     return symbol, None
 
         pairs = await asyncio.gather(*(qualify(s) for s in symbols))
+        looked_up = time.monotonic() - started
         contracts = {symbol: contract for symbol, contract in pairs if contract is not None}
         marks: Dict[str, Decimal] = {}
         if not contracts:
@@ -1041,7 +1042,10 @@ class IBBroker(BrokerAdapter):
         # batch's prices from ITS OWN tickers, and never evict a line the
         # current batch needs. (Before 2026-10-02 a 100-symbol call evicted
         # its own first lines and died on a KeyError: zero quotes.)
-        items = list(contracts.items())
+        # symbols whose lines are already streaming go first: with more
+        # symbols than lines, only the remainder then needs new lines (the
+        # given order would churn twice as many)
+        items = sorted(contracts.items(), key=lambda item: item[0] not in self._mkt)
         new_lines = 0
         for start in range(0, len(items), MARKET_DATA_LINES):
             batch = dict(items[start:start + MARKET_DATA_LINES])
@@ -1075,8 +1079,8 @@ class IBBroker(BrokerAdapter):
                 if price > 0:
                     marks[symbol] = _dec(price)
         if new_lines:
-            logger.info("ib marks: %d/%d priced, %d new lines, %.2fs", len(marks), len(symbols),
-                        new_lines, time.monotonic() - started)
+            logger.info("ib marks: %d/%d priced, %d new lines, %.2fs (contract lookups %.2fs)",
+                        len(marks), len(symbols), new_lines, time.monotonic() - started, looked_up)
         return marks
 
     async def _await_first_ticks(self, lines, budget_end: float) -> None:
