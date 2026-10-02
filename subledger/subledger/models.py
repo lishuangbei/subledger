@@ -237,6 +237,9 @@ class ReconciliationReport:
     drifts: List[DriftItem] = field(default_factory=list)
     positions_checked: int = 0
     acknowledged_orders_skipped: int = 0
+    # cash gap explained as same-day broker fees not yet published (see
+    # BrokerAdapter.fee_posting_cutoff_et); the report is ok meanwhile
+    pending_fees: Decimal = ZERO
 
     def summary(self) -> str:
         if self.ok:
@@ -244,6 +247,8 @@ class ReconciliationReport:
                 " ({} acknowledged foreign order(s) skipped)".format(self.acknowledged_orders_skipped)
                 if self.acknowledged_orders_skipped else ""
             )
+            if self.pending_fees > ZERO:
+                extra += " ({} of same-day broker fees not yet published)".format(self.pending_fees)
             return "reconciliation OK (cash {} == {}, {} symbols checked){}".format(
                 self.expected_cash, self.broker_cash, self.positions_checked, extra
             )

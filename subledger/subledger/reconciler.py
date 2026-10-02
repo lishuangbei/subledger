@@ -51,7 +51,8 @@ class Reconciler:
         self.halt_min_cash_drift = halt_min_cash_drift
 
     def run(self) -> ReconciliationReport:
-        at = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        now = self._now()
+        at = now.isoformat()
         drifts = []
 
         account = self.broker.get_account()
@@ -143,6 +144,10 @@ class Reconciler:
                     pos.last_price = price
                     self.ledger.save_position(pos)
 
+        pending_fees = self._pending_fee_gap(drifts, expected_cash, account.cash, now)
+        if pending_fees is not None:
+            drifts = [d for d in drifts if d.kind != "cash"]
+            logger.info("cash gap %s treated as same-day broker fees not yet published", pending_fees)
         report = ReconciliationReport(
             ok=not drifts,
             at=at,
@@ -151,6 +156,7 @@ class Reconciler:
             drifts=drifts,
             positions_checked=len(symbols),
             acknowledged_orders_skipped=acknowledged_skipped,
+            pending_fees=pending_fees or ZERO,
         )
         self.ledger.save_reconciliation(
             at,
@@ -160,6 +166,7 @@ class Reconciler:
                     "expected_cash": str(report.expected_cash),
                     "broker_cash": str(report.broker_cash),
                     "positions_checked": report.positions_checked,
+                    "pending_fees": str(report.pending_fees),
                     "drifts": [vars(d) for d in report.drifts],
                 }
             ),
@@ -175,6 +182,43 @@ class Reconciler:
                 logger.warning("cash drift %s is below the halt threshold %s: reported, not halted",
                                report.expected_cash - report.broker_cash, self.halt_min_cash_drift)
         return report
+
+    @staticmethod
+    def _now() -> "_dt.datetime":
+        return _dt.datetime.now(_dt.timezone.utc)
+
+    def _pending_fee_gap(self, drifts, expected_cash: Decimal, broker_cash: Decimal,
+                         now: "_dt.datetime") -> Optional[Decimal]:
+        """The cash gap, if it is explained by same-day fees the broker has
+        charged but not yet published; None if it is (or may be) real drift.
+        All must hold: the venue declares a fee lag, the only drift is cash,
+        the ledger is AHEAD of the broker (fees lower broker cash), the time
+        is before today's publication cutoff, the window since yesterday's
+        cutoff has fills, and the gap fits the venue's fee estimate."""
+        cutoff = getattr(self.broker, "fee_posting_cutoff_et", None)
+        if cutoff is None or not drifts or any(d.kind != "cash" for d in drifts):
+            return None
+        gap = expected_cash - broker_cash
+        if gap <= ZERO:
+            return None
+        from zoneinfo import ZoneInfo
+        from .models import OrderSide
+
+        et = now.astimezone(ZoneInfo("America/New_York"))
+        today_cutoff = et.replace(hour=cutoff.hour, minute=cutoff.minute, second=0, microsecond=0)
+        if et >= today_cutoff:
+            return None
+        since = (today_cutoff - _dt.timedelta(days=1)).astimezone(_dt.timezone.utc).isoformat()
+        fills = [o for o in self.ledger.list_orders()
+                 if o.filled_qty > ZERO and (o.updated_at or "") >= since]
+        if not fills:
+            return None
+        bought = sum((o.filled_qty for o in fills if o.side == OrderSide.BUY), ZERO)
+        sold = sum((o.filled_qty for o in fills if o.side == OrderSide.SELL), ZERO)
+        sold_notional = sum((o.filled_qty * o.filled_avg_price for o in fills
+                             if o.side == OrderSide.SELL), ZERO)
+        allowance = self.broker.pending_fee_allowance(bought, sold, sold_notional) + self.cash_tolerance
+        return gap if gap <= allowance else None
 
     def _booking_lock(self):
         """The ledger's shared writer lock (see Ledger.booking_lock); a

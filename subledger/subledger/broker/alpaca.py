@@ -6,6 +6,7 @@ works without it — e.g. in tests with MockBroker).
 
 from __future__ import annotations
 
+import datetime
 import time
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -84,6 +85,17 @@ _STATUS_MAP = {
 class AlpacaBroker(BrokerAdapter):
     name = "alpaca"
     cash_precision = Decimal("0.01")
+    # Regulatory fees (CAT on every trade, REG + TAF on sells) leave cash at
+    # execution; the FEE activities are published once a day, observed
+    # 20:23-20:39 ET (2026-07..09). By 21:00 ET a remaining gap is real.
+    fee_posting_cutoff_et = datetime.time(21, 0)
+
+    def pending_fee_allowance(self, bought_shares: Decimal, sold_shares: Decimal,
+                              sold_notional: Decimal) -> Decimal:
+        # ~2x the observed rates: REG 0.0000208/$, TAF ~0.0002/share,
+        # CAT a cent or two a day.
+        cat = Decimal("0.02") + Decimal("0.0001") * (bought_shares + sold_shares)
+        return cat + Decimal("0.00005") * sold_notional + Decimal("0.0003") * sold_shares
 
     def __init__(self, api_key: str, secret_key: str, paper: bool = True,
                  retries: int = 3, retry_base_delay: float = 0.5):

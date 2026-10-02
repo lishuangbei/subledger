@@ -7,6 +7,7 @@ and reconciler depend only on this module, never on a concrete SDK.
 from __future__ import annotations
 
 import abc
+import datetime
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -105,6 +106,20 @@ class BrokerAdapter(abc.ABC):
     # ledger never accumulates sub-cent residue the broker doesn't have.
     # None = book the exact qty * price product (simulators, tests).
     cash_precision: Optional[Decimal] = None
+    # Venues that take per-trade fees out of cash at execution but publish
+    # the fee activities later declare the US/Eastern wall-clock time by
+    # which a day's fees are published, plus an upper estimate of the fees
+    # still unpublished (pending_fee_allowance). Until that time the
+    # reconciler treats a small "ledger ahead of broker" cash gap after the
+    # day's fills as pending fees, not drift. None = fees arrive with the
+    # fill (IB commissions) or no fees: every gap is drift.
+    fee_posting_cutoff_et: Optional["datetime.time"] = None
+
+    def pending_fee_allowance(self, bought_shares: Decimal, sold_shares: Decimal,
+                              sold_notional: Decimal) -> Decimal:
+        """Upper estimate of fees charged but not yet published for the
+        given same-day fills (only consulted when fee_posting_cutoff_et)."""
+        return Decimal("0")
 
     @abc.abstractmethod
     def submit_order(self, req: OrderRequest, client_order_id: str) -> BrokerSubmitResult:

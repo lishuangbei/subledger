@@ -1,5 +1,15 @@
 # Changelog
 
+## unreleased — 2026-10-02:当日未发布的券商费用不算对账偏差
+
+- Alpaca 在成交时就从现金扣 CAT/REG/TAF 费用,但 FEE 活动每天约 20:30 ET 才发布(实测 20:23–20:39),
+  于是每个有成交的交易日都有几个小时的分级现金偏差;执行器 `require_reconciliation` 因此拒绝当天后续下单
+- `BrokerAdapter.fee_posting_cutoff_et` + `pending_fee_allowance()`:Alpaca = 21:00 ET,额度按当日成交估算
+  (约为实测费率的 2 倍)。IB 不声明(佣金随成交回报)
+- 对账器:仅现金偏差、账本比券商多、未到截止时间、自昨日截止以来有成交、且在额度内 → 记为
+  `pending_fees`,报告 ok;过截止时间仍在、超额、方向相反、无成交、或有任何持仓/外来单偏差 → 照常报告
+- 报告/持久化/REST `/reconcile` 带 `pending_fees`。176 tests
+
 ## unreleased — 2026-10-02:对账器不再用旧快照覆盖成交(trial NVDA 丢 131 股)
 
 - 根因:`Reconciler.run()` 刷新市价时先 `list_positions()`,再走网络取价,最后把**整行**旧快照

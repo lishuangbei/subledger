@@ -350,6 +350,7 @@ def create_app(stack=None, background_loops: bool = True):
             "at": report.at,
             "expected_cash": str(report.expected_cash),
             "broker_cash": str(report.broker_cash),
+            "pending_fees": str(report.pending_fees),
             "drifts": [vars(d) for d in report.drifts],
         }
 
