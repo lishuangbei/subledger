@@ -1,5 +1,13 @@
 # Changelog
 
+## unreleased — 2026-10-02:REST 持仓视图补 reserved_qty(保护单被执行器自己撤掉的根因)
+
+- `GET /accounts/{id}/positions` 增加 `reserved_qty`;`GET /accounts/{id}` 增加 `max_order_notional`。
+  纯增量。背景:executor-kernel 的 REST 客户端用 `qty - reserved_qty` 判断 Protect 是否已布防,
+  缺字段时恒为 qty,Protect 永远"进行中";次日新计划 `abandon` 过期批次时把它的 GTC OCO 当在途单撤掉。
+  实际发生:liveAlpa 4757 META(09-26 周六撤单,Alpaca 09-28 开盘前生效)、liveIB 4757 PANW(10-02);
+  liveIB META 09-26 那次因 IB Gateway 宕机撤单失败而幸存。in-process 宿主(trial)不受影响。164 tests
+
 ## unreleased — 2026-09-30:现金按结算精度记账 + 小额现金偏差可不急停
 
 背景:liveAlpa 2026-09-25 06:35 PT 被 halt_on_drift 急停,账本比券商多 $0.0135 =

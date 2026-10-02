@@ -256,6 +256,10 @@ def create_app(stack=None, background_loops: bool = True):
             {
                 "symbol": p.symbol,
                 "qty": str(p.qty),
+                # shares committed to open sell orders (OCO / stop protection);
+                # qty - reserved_qty = what is still unprotected / sellable.
+                # Executors judge "protection armed" by it.
+                "reserved_qty": str(p.reserved_qty),
                 "avg_cost": str(p.avg_cost),
                 "last_price": str(p.last_price),
                 "unrealized_pnl": str(p.unrealized_pnl),
@@ -386,6 +390,7 @@ def create_app(stack=None, background_loops: bool = True):
             "cash": str(a.cash),
             "reserved_cash": str(a.reserved_cash),
             "margin_multiplier": str(a.margin_multiplier),
+            "max_order_notional": None if a.max_order_notional is None else str(a.max_order_notional),
             "realized_pnl": str(a.realized_pnl),
             "realized_pnl_today": str(a.realized_pnl_today),
             "active": a.active,
