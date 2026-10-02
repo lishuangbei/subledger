@@ -6,6 +6,7 @@ import datetime as dt
 import threading
 import time
 import unittest
+from unittest import mock
 from decimal import Decimal as D
 
 try:
@@ -634,6 +635,20 @@ class IBBrokerTests(unittest.TestCase):
         # lines stay subscribed: the second call reuses them
         self.broker.last_prices(["AAPL"])
         self.assertEqual(self.fake.subscribed.count("AAPL"), 1)
+
+    def test_more_symbols_than_market_data_lines(self):
+        # regression 2026-10-02: a 100-symbol call evicted its own first lines
+        # and raised KeyError, so the pre-close scan saw zero quotes
+        import subledger.broker.ib as ibmod
+
+        symbols = ["S{}".format(i) for i in range(7)]
+        self.fake.tickers = {s: {"last": 100.0 + i} for i, s in enumerate(symbols)}
+        self.broker._tick_wait = 0.2
+        with mock.patch.object(ibmod, "MARKET_DATA_LINES", 3):
+            marks = self.broker.last_prices(symbols)
+            self.assertEqual(sorted(marks), sorted(symbols))
+            self.assertEqual(marks["S0"], D("100"))
+            self.assertLessEqual(len(self.broker._mkt), 3)      # line budget respected
 
     def test_clock_and_asset(self):
         clock = self.broker.get_clock()

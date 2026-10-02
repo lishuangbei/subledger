@@ -1017,31 +1017,43 @@ class IBBroker(BrokerAdapter):
         marks: Dict[str, Decimal] = {}
         if not contracts:
             return marks
-        fresh = []
-        for symbol, contract in contracts.items():
-            ticker = self._mkt.get(symbol)
-            if ticker is None:
-                while len(self._mkt) >= MARKET_DATA_LINES:
-                    victim, old = self._mkt.popitem(last=False)
-                    try:
-                        ib.cancelMktData(old.contract)
-                    except Exception:  # pragma: no cover
-                        pass
-                ticker = ib.reqMktData(contract, "", False, False)
-                self._mkt[symbol] = ticker
-                fresh.append(symbol)
-            else:
-                self._mkt.move_to_end(symbol)
-        if fresh:
-            deadline = time.monotonic() + self._tick_wait
-            while time.monotonic() < deadline:
-                if all(_ticker_price(self._mkt[s]) > 0 for s in fresh):
-                    break
-                await asyncio.sleep(0.1)
-        for symbol in contracts:
-            price = _ticker_price(self._mkt[symbol])
-            if price > 0:
-                marks[symbol] = _dec(price)
+        # More symbols than lines (the executors' pre-close scan asks ~100):
+        # price them in batches of at most MARKET_DATA_LINES, read each
+        # batch's prices from ITS OWN tickers, and never evict a line the
+        # current batch needs. (Before 2026-10-02 a 100-symbol call evicted
+        # its own first lines and died on a KeyError: zero quotes.)
+        items = list(contracts.items())
+        for start in range(0, len(items), MARKET_DATA_LINES):
+            batch = dict(items[start:start + MARKET_DATA_LINES])
+            tickers, fresh = {}, []
+            for symbol, contract in batch.items():
+                ticker = self._mkt.get(symbol)
+                if ticker is None:
+                    while len(self._mkt) >= MARKET_DATA_LINES:
+                        victim = next((k for k in self._mkt if k not in batch), None)
+                        if victim is None:
+                            break
+                        old = self._mkt.pop(victim)
+                        try:
+                            ib.cancelMktData(old.contract)
+                        except Exception:  # pragma: no cover
+                            pass
+                    ticker = ib.reqMktData(contract, "", False, False)
+                    self._mkt[symbol] = ticker
+                    fresh.append(symbol)
+                else:
+                    self._mkt.move_to_end(symbol)
+                tickers[symbol] = ticker
+            if fresh:
+                deadline = time.monotonic() + self._tick_wait
+                while time.monotonic() < deadline:
+                    if all(_ticker_price(tickers[s]) > 0 for s in fresh):
+                        break
+                    await asyncio.sleep(0.1)
+            for symbol, ticker in tickers.items():
+                price = _ticker_price(ticker)
+                if price > 0:
+                    marks[symbol] = _dec(price)
         return marks
 
     def get_clock(self) -> BrokerClock:
