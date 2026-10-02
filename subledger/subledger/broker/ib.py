@@ -428,6 +428,7 @@ class IBBroker(BrokerAdapter):
         self._mkt_since: Dict[str, float] = {}               # symbol -> epoch its line was (re)subscribed
         self._tick_wait = 3.0                                # first-tick wait for new lines (cap)
         self._tick_grace = 1.0                               # after this, a few dark lines may be dropped
+        self._marks_budget = 7.0                             # a marks call answers within ~this (s)
         self._overnight_blocked_until = 0.0     # monotonic; direct routing retried after it
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
@@ -1017,6 +1018,8 @@ class IBBroker(BrokerAdapter):
         instantly. At most MARKET_DATA_LINES lines are kept (LRU), within
         IB's default quota. Only ticks received since a line was subscribed
         count (_fresh_price)."""
+        started = time.monotonic()
+        budget_end = started + self._marks_budget
         ib = await self._connect()
         semaphore = asyncio.Semaphore(20)
 
@@ -1039,6 +1042,7 @@ class IBBroker(BrokerAdapter):
         # current batch needs. (Before 2026-10-02 a 100-symbol call evicted
         # its own first lines and died on a KeyError: zero quotes.)
         items = list(contracts.items())
+        new_lines = 0
         for start in range(0, len(items), MARKET_DATA_LINES):
             batch = dict(items[start:start + MARKET_DATA_LINES])
             tickers, since, fresh = {}, {}, []
@@ -1064,22 +1068,28 @@ class IBBroker(BrokerAdapter):
                 tickers[symbol] = ticker
                 since[symbol] = self._mkt_since.get(symbol, 0.0)
             if fresh:
-                await self._await_first_ticks([(tickers[s], since[s]) for s in fresh])
+                new_lines += len(fresh)
+                await self._await_first_ticks([(tickers[s], since[s]) for s in fresh], budget_end)
             for symbol, ticker in tickers.items():
                 price = _fresh_price(ticker, since[symbol])
                 if price > 0:
                     marks[symbol] = _dec(price)
+        if new_lines:
+            logger.info("ib marks: %d/%d priced, %d new lines, %.2fs", len(marks), len(symbols),
+                        new_lines, time.monotonic() - started)
         return marks
 
-    async def _await_first_ticks(self, lines) -> None:
+    async def _await_first_ticks(self, lines, budget_end: float) -> None:
         """Wait for new lines' first ticks: until all have priced, at most
-        _tick_wait. A symbol without data (no permission, halted, a thin
-        after-hours tape) never ticks; so once _tick_grace has passed and no
-        line has priced for half that long, a few dark lines (a tenth of the
-        new ones, at least 2) no longer hold the call. A cold 100-symbol
-        scan must answer well inside its caller's 10 s timeout."""
+        _tick_wait, and never past `budget_end` (the call's _marks_budget:
+        the executors' pre-close scan gives up at 10 s, and a late full answer
+        is worth less to it than a partial one in time). A symbol without
+        data (no permission, halted, a thin after-hours tape) never ticks;
+        so once _tick_grace has passed and no line has priced for half that
+        long, a few dark lines (a tenth of the new ones, at least 2) no
+        longer hold the call."""
         began = last_progress = time.monotonic()
-        deadline = began + self._tick_wait
+        deadline = min(began + self._tick_wait, budget_end)
         priced = 0
         while True:
             count = sum(1 for ticker, since in lines if _fresh_price(ticker, since) > 0)

@@ -686,6 +686,22 @@ class IBBrokerTests(unittest.TestCase):
             self.fake.tick("A")
             self.assertEqual(self.broker.last_prices(["A"]), {"A": D("11")})
 
+    def test_marks_call_answers_within_its_budget(self):
+        # slow first ticks in every batch: the call stops waiting at its
+        # budget instead of 2 x _tick_wait (it used to run past the
+        # executors' 10 s timeout, which then saw no quotes at all)
+        import subledger.broker.ib as ibmod
+
+        symbols = ["D0", "D1", "D2", "D3"]
+        self.fake.tickers = {s: {"last": 5.0} for s in symbols}
+        self.fake.dark.update(symbols)
+        self.broker._tick_wait, self.broker._marks_budget = 5.0, 0.6
+        with mock.patch.object(ibmod, "MARKET_DATA_LINES", 2):
+            began = time.monotonic()
+            self.assertEqual(self.broker.last_prices(symbols), {})
+            self.assertLess(time.monotonic() - began, 2.0)
+            self.assertEqual(len(self.broker._mkt), 2)          # second batch still subscribed
+
     def test_dark_symbols_do_not_hold_up_the_call(self):
         # a symbol without data never ticks; the call must not sit out its
         # whole wait for it (the executors' pre-close scan gives up at 10 s)
