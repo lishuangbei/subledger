@@ -76,6 +76,8 @@ class FakeIB:
         self._positions = []
         self._portfolio = []
         self.tickers = {}
+        self.dark = set()               # symbols whose lines never tick (no data / no permission)
+        self._live = {}                 # symbol -> Ticker, reused on re-subscription like ib_async
         self.unknown = set()
         self.overnight_hours = ""       # set to a window covering "now" to open the overnight venue
         self.block_direct_routing = False   # emulate the gateway's API precaution (error 10329)
@@ -96,6 +98,7 @@ class FakeIB:
 
     def disconnect(self):
         self.connected = False
+        self._live = {}                 # ib_async's wrapper.reset() drops every Ticker
 
     def managedAccounts(self):
         return list(self.accounts)
@@ -153,11 +156,25 @@ class FakeIB:
     def reqMktData(self, contract, genericTickList="", snapshot=False, regulatorySnapshot=False):
         from ib_async import Ticker
 
-        ticker = Ticker(contract=contract)
-        for name, value in self.tickers.get(contract.symbol, {}).items():
-            setattr(ticker, name, value)
+        # like ib_async's wrapper.startTicker: ONE Ticker per contract, handed
+        # back with its old prices when the line is subscribed again
+        ticker = self._live.get(contract.symbol)
+        if ticker is None:
+            ticker = self._live[contract.symbol] = Ticker(contract=contract)
         self.subscribed = getattr(self, "subscribed", []) + [contract.symbol]
+        self.tick(contract.symbol)
         return ticker
+
+    def tick(self, symbol):
+        """Deliver `tickers[symbol]` to its line as a new tick, stamped like
+        ib_async's wrapper.tcpDataProcessed does. Dark symbols never tick."""
+        ticker = self._live.get(symbol)
+        fields = self.tickers.get(symbol, {})
+        if ticker is None or symbol in self.dark or not fields:
+            return
+        for name, value in fields.items():
+            setattr(ticker, name, value)
+        ticker.timestamp = time.time()
 
     def cancelMktData(self, contract):
         self.cancelled_lines = getattr(self, "cancelled_lines", []) + [contract.symbol]
@@ -649,6 +666,45 @@ class IBBrokerTests(unittest.TestCase):
             self.assertEqual(sorted(marks), sorted(symbols))
             self.assertEqual(marks["S0"], D("100"))
             self.assertLessEqual(len(self.broker._mkt), 3)      # line budget respected
+
+    def test_resubscribed_line_waits_for_a_new_tick(self):
+        # ib_async hands a re-subscribed contract its old Ticker back, still
+        # holding the price from when the line was dropped (could be hours):
+        # that price must not be served as current
+        import subledger.broker.ib as ibmod
+
+        self.fake.tickers = {"A": {"last": 10.0}, "B": {"last": 20.0}, "C": {"last": 30.0}}
+        self.broker._tick_wait = 0.3
+        with mock.patch.object(ibmod, "MARKET_DATA_LINES", 2):
+            self.assertEqual(self.broker.last_prices(["A"]), {"A": D("10")})
+            self.broker.last_prices(["B", "C"])                    # evicts A's line
+            self.assertNotIn("A", self.broker._mkt)
+            self.fake.tickers["A"] = {"last": 11.0}                # the market moved...
+            self.fake.dark.add("A")                                # ...no tick has come in yet
+            self.assertEqual(self.broker.last_prices(["A"]), {})   # not the stale 10
+            self.fake.dark.discard("A")
+            self.fake.tick("A")
+            self.assertEqual(self.broker.last_prices(["A"]), {"A": D("11")})
+
+    def test_dark_symbols_do_not_hold_up_the_call(self):
+        # a symbol without data never ticks; the call must not sit out its
+        # whole wait for it (the executors' pre-close scan gives up at 10 s)
+        symbols = ["S{}".format(i) for i in range(20)]
+        self.fake.tickers = {s: {"last": 50.0} for s in symbols}
+        self.fake.dark.add("S7")
+        self.broker._tick_wait, self.broker._tick_grace = 5.0, 0.2
+        began = time.monotonic()
+        marks = self.broker.last_prices(symbols)
+        self.assertLess(time.monotonic() - began, 2.0)
+        self.assertEqual(len(marks), 19)
+        self.assertNotIn("S7", marks)
+        # ...while a lone new line still gets the whole wait for its first tick
+        self.fake.tickers["LONE"] = {"last": 1.0}
+        self.fake.dark.add("LONE")
+        self.broker._tick_wait = 0.4
+        began = time.monotonic()
+        self.assertEqual(self.broker.last_prices(["LONE"]), {})
+        self.assertGreaterEqual(time.monotonic() - began, 0.35)
 
     def test_clock_and_asset(self):
         clock = self.broker.get_clock()

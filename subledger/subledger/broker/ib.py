@@ -166,6 +166,17 @@ def _ticker_price(ticker) -> float:
     return 0.0
 
 
+def _fresh_price(ticker, since: float) -> float:
+    """_ticker_price, but only from ticks received at or after `since` (epoch
+    seconds, when the line was subscribed). ib_async keeps one Ticker per
+    contract and hands it back on re-subscription still holding the prices
+    it had when the line was dropped, possibly hours ago."""
+    stamp = _num(getattr(ticker, "timestamp", None))
+    if stamp <= 0 or stamp < since:
+        return 0.0
+    return _ticker_price(ticker)
+
+
 def _permid(trade) -> int:
     return int(getattr(trade.order, "permId", 0) or getattr(trade.orderStatus, "permId", 0) or 0)
 
@@ -414,7 +425,9 @@ class IBBroker(BrokerAdapter):
         self._hours: Optional[Tuple[str, str, str]] = None
         self._overnight: Dict[str, tuple] = {}
         self._mkt: "OrderedDict[str, Any]" = OrderedDict()   # symbol -> streaming Ticker (LRU)
-        self._tick_wait = 3.0                                # first-tick wait for new lines
+        self._mkt_since: Dict[str, float] = {}               # symbol -> epoch its line was (re)subscribed
+        self._tick_wait = 3.0                                # first-tick wait for new lines (cap)
+        self._tick_grace = 1.0                               # after this, a few dark lines may be dropped
         self._overnight_blocked_until = 0.0     # monotonic; direct routing retried after it
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
@@ -505,6 +518,7 @@ class IBBroker(BrokerAdapter):
 
     def _on_disconnected(self, *_args) -> None:
         self._mkt.clear()          # streaming lines die with the session; re-subscribe lazily
+        self._mkt_since.clear()
         if self._closing:
             return
         logger.warning("ib gateway %s:%s disconnected; reconnecting on next call", self._host, self._port)
@@ -998,9 +1012,11 @@ class IBBroker(BrokerAdapter):
     async def _last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
         """Marks from STREAMING market-data lines that stay subscribed: a
         snapshot request (reqTickers) waits ~10-13s per batch on delayed data,
-        which starves batch callers. New symbols cost one short wait for the
-        first tick; symbols seen before answer instantly. At most
-        MARKET_DATA_LINES lines are kept (LRU), within IB's default quota."""
+        which starves batch callers. A new or re-subscribed line costs one
+        short wait for its first tick; a line still subscribed answers
+        instantly. At most MARKET_DATA_LINES lines are kept (LRU), within
+        IB's default quota. Only ticks received since a line was subscribed
+        count (_fresh_price)."""
         ib = await self._connect()
         semaphore = asyncio.Semaphore(20)
 
@@ -1025,7 +1041,7 @@ class IBBroker(BrokerAdapter):
         items = list(contracts.items())
         for start in range(0, len(items), MARKET_DATA_LINES):
             batch = dict(items[start:start + MARKET_DATA_LINES])
-            tickers, fresh = {}, []
+            tickers, since, fresh = {}, {}, []
             for symbol, contract in batch.items():
                 ticker = self._mkt.get(symbol)
                 if ticker is None:
@@ -1034,27 +1050,49 @@ class IBBroker(BrokerAdapter):
                         if victim is None:
                             break
                         old = self._mkt.pop(victim)
+                        self._mkt_since.pop(victim, None)
                         try:
                             ib.cancelMktData(old.contract)
                         except Exception:  # pragma: no cover
                             pass
+                    self._mkt_since[symbol] = time.time()
                     ticker = ib.reqMktData(contract, "", False, False)
                     self._mkt[symbol] = ticker
                     fresh.append(symbol)
                 else:
                     self._mkt.move_to_end(symbol)
                 tickers[symbol] = ticker
+                since[symbol] = self._mkt_since.get(symbol, 0.0)
             if fresh:
-                deadline = time.monotonic() + self._tick_wait
-                while time.monotonic() < deadline:
-                    if all(_ticker_price(tickers[s]) > 0 for s in fresh):
-                        break
-                    await asyncio.sleep(0.1)
+                await self._await_first_ticks([(tickers[s], since[s]) for s in fresh])
             for symbol, ticker in tickers.items():
-                price = _ticker_price(ticker)
+                price = _fresh_price(ticker, since[symbol])
                 if price > 0:
                     marks[symbol] = _dec(price)
         return marks
+
+    async def _await_first_ticks(self, lines) -> None:
+        """Wait for new lines' first ticks: until all have priced, at most
+        _tick_wait. A symbol without data (no permission, halted, a thin
+        after-hours tape) never ticks; so once _tick_grace has passed and no
+        line has priced for half that long, a few dark lines (a tenth of the
+        new ones, at least 2) no longer hold the call. A cold 100-symbol
+        scan must answer well inside its caller's 10 s timeout."""
+        began = last_progress = time.monotonic()
+        deadline = began + self._tick_wait
+        priced = 0
+        while True:
+            count = sum(1 for ticker, since in lines if _fresh_price(ticker, since) > 0)
+            now = time.monotonic()
+            if count > priced:
+                priced, last_progress = count, now
+            if count == len(lines) or now >= deadline:
+                return
+            if (count and now - began >= self._tick_grace
+                    and now - last_progress >= self._tick_grace / 2
+                    and len(lines) - count <= max(2, len(lines) // 10)):
+                return
+            await asyncio.sleep(0.1)
 
     def get_clock(self) -> BrokerClock:
         return self._call(self._clock)
