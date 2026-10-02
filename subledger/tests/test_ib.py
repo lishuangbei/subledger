@@ -681,6 +681,29 @@ class IBBrokerTests(unittest.TestCase):
             self.assertEqual(len(self.broker.last_prices(symbols)), 4)
             self.assertEqual(len(self.fake.subscribed) - before, 1)
 
+    def test_lines_reopen_after_reconnect(self):
+        # the Gateway's nightly restart drops every quote line; the next
+        # connection re-opens them, so the next large call finds them streaming
+        self.fake.tickers = {s: {"last": 10.0} for s in ("A", "B")}
+        self.broker._tick_wait = 0.2
+        self.broker.last_prices(["A", "B"])
+
+        async def drop():
+            self.fake.disconnect()
+            self.fake.disconnectedEvent.emit()
+
+        self.broker._call(drop)
+        self.assertEqual(len(self.broker._mkt), 0)
+        before = len(self.fake.subscribed)
+        self.broker.get_clock()                                    # any call reconnects
+        deadline = time.monotonic() + 2
+        while len(self.broker._mkt) < 2 and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(sorted(self.broker._mkt), ["A", "B"])
+        self.assertEqual(len(self.fake.subscribed) - before, 2)
+        self.assertEqual(self.broker.last_prices(["A", "B"]), {"A": D("10"), "B": D("10")})
+        self.assertEqual(len(self.fake.subscribed) - before, 2)    # nothing new opened
+
     def test_resubscribed_line_waits_for_a_new_tick(self):
         # ib_async hands a re-subscribed contract its old Ticker back, still
         # holding the price from when the line was dropped (could be hours):

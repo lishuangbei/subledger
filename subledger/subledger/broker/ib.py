@@ -429,6 +429,8 @@ class IBBroker(BrokerAdapter):
         self._tick_wait = 3.0                                # first-tick wait for new lines (cap)
         self._tick_grace = 1.0                               # after this, a few dark lines may be dropped
         self._marks_budget = 7.0                             # a marks call answers within ~this (s)
+        self._mkt_reopen: List[str] = []                     # lines a disconnect closed, re-opened on connect
+        self._reopen_task: Optional[asyncio.Future] = None
         self._overnight_blocked_until = 0.0     # monotonic; direct routing retried after it
         self._open_order_ticks: Dict[int, int] = {}
         self._order_req_lock: Optional[asyncio.Lock] = None
@@ -515,10 +517,41 @@ class IBBroker(BrokerAdapter):
             logger.warning("ib: reqMarketDataType(%s) failed", self._mdt)
         logger.info("ib connected %s:%s client %s account %s (%s)", self._host, self._port,
                     self._client_id, account, "paper" if self._paper else "LIVE")
+        if self._mkt_reopen:
+            symbols, self._mkt_reopen = self._mkt_reopen, []
+            self._reopen_task = asyncio.ensure_future(self._reopen_lines(self._ib, symbols))
         return self._ib
 
+    async def _reopen_lines(self, ib, symbols: List[str]) -> None:
+        """Re-open the quote lines a disconnect closed. The Gateway's nightly
+        restart drops every line, and a new line's first tick can take
+        seconds (after hours, several), so otherwise the executors' next
+        pre-close scan opens ~100 lines inside its 10 s window. Paced well
+        under ib_async's 45 requests/s so orders don't queue behind it."""
+        reopened = 0
+        for symbol in symbols:
+            if self._ib is not ib or not ib.isConnected():
+                return
+            contract = self._contracts.get(symbol.upper())
+            if contract is None or symbol in self._mkt or len(self._mkt) >= MARKET_DATA_LINES:
+                continue
+            try:
+                self._mkt_since[symbol] = time.time()
+                self._mkt[symbol] = ib.reqMktData(contract, "", False, False)
+            except Exception as exc:
+                logger.warning("ib: re-opening quote lines stopped: %s", exc)
+                return
+            reopened += 1
+            await asyncio.sleep(0.05)
+        if reopened:
+            logger.info("ib: re-opened %d quote lines after reconnecting", reopened)
+
     def _on_disconnected(self, *_args) -> None:
-        self._mkt.clear()          # streaming lines die with the session; re-subscribe lazily
+        # streaming lines die with the session: remember them so the next
+        # connection re-opens them (_reopen_lines)
+        if self._mkt:
+            self._mkt_reopen = list(self._mkt)
+        self._mkt.clear()
         self._mkt_since.clear()
         if self._closing:
             return
