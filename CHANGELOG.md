@@ -1,5 +1,14 @@
 # Changelog
 
+## unreleased — 2026-10-02:对账器不再用旧快照覆盖成交(trial NVDA 丢 131 股)
+
+- 根因:`Reconciler.run()` 刷新市价时先 `list_positions()`,再走网络取价,最后把**整行**旧快照
+  `save_position` 回去,且不持路由器的锁;取价期间 stream 线程入账的成交被覆盖(trial 4755 NVDA
+  155/131/33 三笔部分成交,131 股的持仓更新丢失,现金正确)。同一写法还会让取价期间清仓的持仓"复活"
+- 修复:`Ledger.booking_lock` = 账本自身的写锁,Router 用它作为路由锁,Reconciler 的三处写
+  (刷新市价、分红/费用归属、absorb)都在它之下**重新读取**后只改该改的字段;网络调用留在锁外
+- 新测试在旧代码上复现事故(155 != 286、319 复活),新代码通过。168 tests
+
 ## unreleased — 2026-10-02:REST 持仓视图补 reserved_qty(保护单被执行器自己撤掉的根因)
 
 - `GET /accounts/{id}/positions` 增加 `reserved_qty`;`GET /accounts/{id}` 增加 `max_order_notional`。

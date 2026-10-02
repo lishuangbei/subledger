@@ -181,6 +181,13 @@ class Ledger:
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # ONE lock for every in-process writer of this ledger: the router
+        # holds it across its read-modify-write sequences (fill booking), the
+        # reconciler across its own, and every ledger write method takes it.
+        # A writer that read rows, released, and saved them later would write
+        # back stale values over a concurrent fill (trial NVDA 2026-10-02:
+        # 131 shares lost to a mark refresh racing a partial fill).
+        self.booking_lock = self._lock
         # WAL + NORMAL sync: cuts per-commit fsync cost on the order hot path
         # (several small commits per order) while staying crash-safe.
         try:

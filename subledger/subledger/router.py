@@ -92,7 +92,8 @@ class Router:
         self.ledger = ledger
         self.broker = broker
         self.eager_sync = eager_sync
-        self._lock = threading.RLock()
+        # shared with the ledger and the reconciler (Ledger.booking_lock)
+        self._lock = getattr(ledger, "booking_lock", None) or threading.RLock()
         self._pending_verification: Optional[str] = None
         if expected_account_id:
             try:

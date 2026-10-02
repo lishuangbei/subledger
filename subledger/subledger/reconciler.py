@@ -121,19 +121,27 @@ class Reconciler:
             logger.warning("could not list broker orders during reconcile: %s", exc)
 
         # 4) refresh marks ---------------------------------------------
+        # Prices come from the network OUTSIDE the booking lock; the write is
+        # a FRESH read + price-only change UNDER it. Saving the rows listed
+        # here would write a stale qty/reserve back over any fill booked while
+        # the prices were fetched (or resurrect a position closed meanwhile).
         ledger_positions = self.ledger.list_positions()
         marks = {}
         try:
             marks = self.broker.last_prices(sorted({p.symbol for p in ledger_positions}))
         except BrokerError as exc:
             logger.warning("could not refresh marks: %s", exc)
-        for pos in ledger_positions:
-            price = marks.get(pos.symbol)
-            if price is None and pos.symbol in broker_pos:
-                price = broker_pos[pos.symbol].current_price
-            if price and price > ZERO:
-                pos.last_price = price
-                self.ledger.save_position(pos)
+        with self._booking_lock():
+            for listed in ledger_positions:
+                price = marks.get(listed.symbol)
+                if price is None and listed.symbol in broker_pos:
+                    price = broker_pos[listed.symbol].current_price
+                if not price or price <= ZERO:
+                    continue
+                pos = self.ledger.get_position(listed.sub_account_id, listed.symbol)
+                if (pos.qty != ZERO or pos.reserved_qty != ZERO) and pos.last_price != price:
+                    pos.last_price = price
+                    self.ledger.save_position(pos)
 
         report = ReconciliationReport(
             ok=not drifts,
@@ -167,6 +175,15 @@ class Reconciler:
                 logger.warning("cash drift %s is below the halt threshold %s: reported, not halted",
                                report.expected_cash - report.broker_cash, self.halt_min_cash_drift)
         return report
+
+    def _booking_lock(self):
+        """The ledger's shared writer lock (see Ledger.booking_lock); a
+        private one for ledgers that predate it."""
+        lock = getattr(self.ledger, "booking_lock", None)
+        if lock is None:
+            import threading
+            lock = self.__dict__.setdefault("_fallback_lock", threading.RLock())
+        return lock
 
     def _warrants_halt(self, report: ReconciliationReport) -> bool:
         if self.halt_min_cash_drift is None:
@@ -208,76 +225,82 @@ class Reconciler:
             return result
 
         for activity in activities:
-            if not activity.activity_id or activity.activity_id in processed:
-                continue
-            if activity.kind not in ("dividend", "fee"):
-                # Deposits/withdrawals/journals are NEVER auto-booked: the
-                # initial funding was already adopted at ledger init, and any
-                # later transfer should be an explicit operator decision
-                # (absorb_cash_drift). Mark as seen so it isn't re-examined.
-                self.ledger.record_processed_activity(
-                    activity.activity_id, activity.kind, activity.symbol,
-                    activity.amount, _json.dumps({"skipped": "manual-only kind"}),
-                )
-                logger.info("cash activity %s (%s %s) left for operator absorb",
-                            activity.activity_id, activity.kind, activity.amount)
-                continue
-            allocations = {}
-            holders = []
-            owner = None
-            if activity.kind == "fee" and activity.order_client_id:
-                owner_id = sub_account_of(activity.order_client_id)
-                if owner_id is not None:
-                    try:
-                        owner = self.ledger.get_sub_account(owner_id)
-                    except KeyError:
-                        owner = None
-            if activity.kind == "dividend" and activity.symbol:
-                holders = [
-                    p for p in self.ledger.list_positions()
-                    if p.symbol == activity.symbol and p.qty > ZERO
-                ]
-            if owner is not None:
-                owner.cash += activity.amount
-                owner.realized_pnl += activity.amount
-                owner.realized_pnl_today += activity.amount
-                self.ledger.save_sub_account(owner)
-                allocations[owner.id] = str(activity.amount)
-                result["fees"] += 1
-                logger.info("fee %s %s (%s) charged to sub-account %s",
-                            activity.symbol, activity.amount, activity.order_client_id, owner.id)
-            elif holders:
-                total_qty = sum((p.qty for p in holders), ZERO)
-                remaining = activity.amount
-                for i, pos in enumerate(holders):
-                    share = (
-                        remaining if i == len(holders) - 1
-                        else (activity.amount * pos.qty / total_qty).quantize(Decimal("0.0001"))
-                    )
-                    remaining -= share
-                    acct = self.ledger.get_sub_account(pos.sub_account_id)
-                    acct.cash += share
-                    acct.realized_pnl += share
-                    acct.realized_pnl_today += share
-                    self.ledger.save_sub_account(acct)
-                    allocations[pos.sub_account_id] = str(share)
-                result["dividends"] += 1
-                logger.info("dividend %s %s attributed: %s", activity.symbol,
-                            activity.amount, allocations)
-            else:
-                self.ledger.set_unallocated_cash(
-                    self.ledger.unallocated_cash() + activity.amount
-                )
-                allocations["unassigned"] = str(activity.amount)
-                result["pool"] += 1
-                logger.info("cash activity %s (%s %s) -> unassigned pool",
-                            activity.activity_id, activity.kind, activity.amount)
-            result["total_amount"] += activity.amount
+            with self._booking_lock():
+                self._apply_activity(activity, processed, result, _json)
+        return result
+
+    def _apply_activity(self, activity, processed, result, _json) -> None:
+        """One broker cash activity, applied with fresh reads under the
+        booking lock so a fill booked concurrently is never overwritten."""
+        if not activity.activity_id or activity.activity_id in processed:
+            return
+        if activity.kind not in ("dividend", "fee"):
+            # Deposits/withdrawals/journals are NEVER auto-booked: the
+            # initial funding was already adopted at ledger init, and any
+            # later transfer should be an explicit operator decision
+            # (absorb_cash_drift). Mark as seen so it isn't re-examined.
             self.ledger.record_processed_activity(
                 activity.activity_id, activity.kind, activity.symbol,
-                activity.amount, _json.dumps(allocations),
+                activity.amount, _json.dumps({"skipped": "manual-only kind"}),
             )
-        return result
+            logger.info("cash activity %s (%s %s) left for operator absorb",
+                        activity.activity_id, activity.kind, activity.amount)
+            return
+        allocations = {}
+        holders = []
+        owner = None
+        if activity.kind == "fee" and activity.order_client_id:
+            owner_id = sub_account_of(activity.order_client_id)
+            if owner_id is not None:
+                try:
+                    owner = self.ledger.get_sub_account(owner_id)
+                except KeyError:
+                    owner = None
+        if activity.kind == "dividend" and activity.symbol:
+            holders = [
+                p for p in self.ledger.list_positions()
+                if p.symbol == activity.symbol and p.qty > ZERO
+            ]
+        if owner is not None:
+            owner.cash += activity.amount
+            owner.realized_pnl += activity.amount
+            owner.realized_pnl_today += activity.amount
+            self.ledger.save_sub_account(owner)
+            allocations[owner.id] = str(activity.amount)
+            result["fees"] += 1
+            logger.info("fee %s %s (%s) charged to sub-account %s",
+                        activity.symbol, activity.amount, activity.order_client_id, owner.id)
+        elif holders:
+            total_qty = sum((p.qty for p in holders), ZERO)
+            remaining = activity.amount
+            for i, pos in enumerate(holders):
+                share = (
+                    remaining if i == len(holders) - 1
+                    else (activity.amount * pos.qty / total_qty).quantize(Decimal("0.0001"))
+                )
+                remaining -= share
+                acct = self.ledger.get_sub_account(pos.sub_account_id)
+                acct.cash += share
+                acct.realized_pnl += share
+                acct.realized_pnl_today += share
+                self.ledger.save_sub_account(acct)
+                allocations[pos.sub_account_id] = str(share)
+            result["dividends"] += 1
+            logger.info("dividend %s %s attributed: %s", activity.symbol,
+                        activity.amount, allocations)
+        else:
+            self.ledger.set_unallocated_cash(
+                self.ledger.unallocated_cash() + activity.amount
+            )
+            allocations["unassigned"] = str(activity.amount)
+            result["pool"] += 1
+            logger.info("cash activity %s (%s %s) -> unassigned pool",
+                        activity.activity_id, activity.kind, activity.amount)
+        result["total_amount"] += activity.amount
+        self.ledger.record_processed_activity(
+            activity.activity_id, activity.kind, activity.symbol,
+            activity.amount, _json.dumps(allocations),
+        )
 
     def acknowledge_foreign_orders(self, report: ReconciliationReport, note: str = "") -> list:
         """Operator action: accept the unknown orders in `report` as explained
@@ -296,11 +319,12 @@ class Reconciler:
         """Operator action: accept an external cash change (deposit, dividend,
         fee) into the unallocated pool so the ledger matches reality again."""
         account = self.broker.get_account()
-        expected = self.ledger.unallocated_cash()
-        for acct in self.ledger.list_sub_accounts():
-            expected += acct.cash
-        delta = account.cash - expected
-        if delta != ZERO:
-            self.ledger.set_unallocated_cash(self.ledger.unallocated_cash() + delta)
-            logger.warning("absorbed cash drift of %s into unallocated pool %s", delta, note)
+        with self._booking_lock():
+            expected = self.ledger.unallocated_cash()
+            for acct in self.ledger.list_sub_accounts():
+                expected += acct.cash
+            delta = account.cash - expected
+            if delta != ZERO:
+                self.ledger.set_unallocated_cash(self.ledger.unallocated_cash() + delta)
+                logger.warning("absorbed cash drift of %s into unallocated pool %s", delta, note)
         return delta
