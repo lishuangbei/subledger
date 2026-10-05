@@ -86,6 +86,17 @@ if _HAVE_PYDANTIC:
         limit_price: Optional[str] = None
         stop_price: Optional[str] = None
 
+    class HeartbeatBody(_BaseModel):
+        executor_id: str
+        sub_account_id: str
+        name: str = ""
+        kind: str = "external"
+        pid: Optional[int] = None
+        status: str = "ok"
+        message: str = ""
+        interval_s: Optional[int] = None
+        expect_next_by: Optional[str] = None
+
     class CashCallBody(_BaseModel):
         amount: str
         deadline: Optional[str] = None     # ISO-8601; default = next session close
@@ -360,6 +371,37 @@ def create_app(stack=None, background_loops: bool = True):
         if latest is None:
             raise HTTPException(404, "no reconciliation has run yet")
         return latest
+
+    # -- executor heartbeats (subledger.executors) --------------------------
+
+    @app.post("/executors/heartbeat")
+    def executor_heartbeat(body: HeartbeatBody):
+        """Each executor reports itself here, at least as often as it
+        promises (interval_s / expect_next_by). Metadata only: never blocks
+        or alters trading."""
+        try:
+            row = ledger.record_executor_heartbeat(
+                body.executor_id, body.sub_account_id, name=body.name, kind=body.kind,
+                pid=body.pid, status=body.status, message=body.message,
+                interval_s=body.interval_s, expect_next_by=body.expect_next_by)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc))
+        try:
+            ledger.get_sub_account(body.sub_account_id)
+            known = True
+        except KeyError:
+            known = False
+        return {"ok": True, "sub_account_known": known, "executor": row}
+
+    @app.get("/executors")
+    def executors():
+        return ledger.executor_health()
+
+    @app.delete("/executors/{executor_id}")
+    def retire_executor(executor_id: str):
+        if not ledger.retire_executor(executor_id):
+            raise HTTPException(status_code=404, detail="no active executor {}".format(executor_id))
+        return {"retired": executor_id}
 
     @app.get("/clock")
     def clock():

@@ -18,7 +18,12 @@ Commands
   status   app/runtime health: instance identity, booking-writer process,
            market clock, halt flag, latest reconciliation, equity-history
            freshness, open-order count — plus each sub-account's
-           CONFIGURATION (margin, limits, whitelist; not balances)
+           CONFIGURATION (margin, limits, whitelist; not balances) and its
+           EXECUTOR (heartbeat health; problems in red)
+  executors [retire <executor_id> | waive <sub> <reason...> | unwaive <sub>]
+           executor heartbeats per sub-account (light ops, daemon may run):
+           list; stop expecting a decommissioned executor; mark a
+           sub-account as deliberately running without one / undo
   accounts show <ID>
            one account in depth: balances, live buying power, positions,
            open orders, settings
@@ -228,6 +233,13 @@ def run(stack, argv) -> int:
 
     sub.add_parser("status")
 
+    p_exec = sub.add_parser("executors")
+    p_exec.add_argument("action", nargs="?", default="list",
+                        choices=["list", "retire", "waive", "unwaive"])
+    p_exec.add_argument("target", nargs="?", default=None,
+                        help="executor_id (retire) or sub-account id (waive/unwaive)")
+    p_exec.add_argument("reason", nargs="*", help="waive: why it has no executor")
+
     p_show = acc_sub.add_parser("show")
     p_show.add_argument("id")
 
@@ -277,6 +289,8 @@ def run(stack, argv) -> int:
 def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
     if args.command == "ops":
         return _ops(args, ledger, router, reconciler)
+    if args.command == "executors":
+        return _executors(args, ledger)
     if args.command == "accounts":
         if args.subcommand == "list":
             from .models import ZERO as _Z
@@ -488,6 +502,7 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
 
         latest_recon = ledger.latest_reconciliation()
         eq = ledger.equity_history(limit=1)
+        health = ledger.executor_health()
         configs = [{
             "id": a.id, "name": a.name, "active": a.active,
             "cash_call": str(a.cash_call), "cash_call_deadline": a.cash_call_deadline,
@@ -496,6 +511,7 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
             "daily_loss_limit": None if a.daily_loss_limit is None else str(a.daily_loss_limit),
             "whitelist_size": None if a.symbol_whitelist is None else len(a.symbol_whitelist),
             "allow_short": a.allow_short,
+            "executor": _executor_brief(health["accounts"].get(a.id)),
         } for a in ledger.list_sub_accounts()]
         payload = {
             "instance": identity,
@@ -507,6 +523,8 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
                 "ok": latest_recon.get("ok"), "at": latest_recon.get("at")},
             "latest_equity_snapshot_at": eq[0]["at"] if eq else None,
             "accounts_config": configs,
+            "executor_problems": [{"scope": scope, "problem": text}
+                                  for scope, text in health["problems"]],
         }
         if args.json:
             _emit(payload, True)
@@ -528,15 +546,25 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
                 "ok={} at={}".format(lr["ok"], lr["at"]) if lr else "never ran"))
             print("equity history: last row {}".format(payload["latest_equity_snapshot_at"] or "none"))
             print()
-            fmt = "{:6s} {:6s} {:>5s} {:>14s} {:>12s} {:>9s} {:>6s}  {}"
+            cells = {c["id"]: _executor_cell(c["executor"]) for c in configs}
+            width = min(56, max([_display_width("executor")] +
+                                [_display_width(text) for text, _bad in cells.values()]))
+            fmt = "{:6s} {:6s} {:>5s} {:>14s} {:>12s} {:>9s} {:>6s}  {}  {}"
             print(fmt.format("id", "active", "mult", "max_notional",
-                             "loss_limit", "whitelist", "short", "name"))
+                             "loss_limit", "whitelist", "short", _pad("executor", width), "name"))
             for c in configs:
+                text, bad = cells[c["id"]]
+                cell = _pad(text, width)
                 print(fmt.format(
                     c["id"], str(c["active"]), c["margin_multiplier"],
                     _money(c["max_order_notional"]), _money(c["daily_loss_limit"]),
                     "-" if c["whitelist_size"] is None else str(c["whitelist_size"]),
-                    str(c["allow_short"]), c["name"]))
+                    str(c["allow_short"]), _red(cell) if bad else cell, c["name"]))
+            if payload["executor_problems"]:
+                print()
+                print(_red("✗ 执行器问题 {} 项：".format(len(payload["executor_problems"]))))
+                for item in payload["executor_problems"]:
+                    print(_red("  [{}] {}".format(item["scope"], item["problem"])))
 
     elif args.command == "equity":
         if args.raw:
@@ -717,6 +745,102 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
     return 0
 
 
+def _executor_brief(entry) -> Optional[dict]:
+    """The status payload's per-sub-account executor view (None = inactive
+    sub-account, not checked)."""
+    if entry is None:
+        return None
+    keep = ("executor_id", "name", "kind", "pid", "state", "status", "message", "age_s",
+            "interval_s", "last_heartbeat_at", "expect_next_by")
+    return {"state": entry["state"], "summary": entry["summary"], "waiver": entry["waiver"],
+            "problems": entry["problems"],
+            "executors": [{k: r.get(k) for k in keep} for r in entry["executors"]]}
+
+
+def _executor_cell(brief):
+    """(text, is_problem) for the status table's executor column."""
+    if brief is None:
+        return "-", False
+    return brief["summary"], brief["state"] in ("missing", "problem")
+
+
+def _display_width(text: str) -> int:
+    import unicodedata as _ud
+    return sum(2 if _ud.east_asian_width(ch) in ("W", "F") else 1 for ch in str(text))
+
+
+def _pad(text: str, width: int) -> str:
+    text = str(text)
+    while _display_width(text) > width and len(text) > 1:
+        text = text[:-2] + "…"
+    return text + " " * max(0, width - _display_width(text))
+
+
+def _red(text: str) -> str:
+    return "\033[1;31m{}\033[0m".format(text) if _returns_colour_enabled() else text
+
+
+def _executors(args, ledger) -> int:
+    """Executor heartbeats: list, retire, waive / unwaive (light writes)."""
+    if args.action == "retire":
+        if not args.target:
+            raise ValueError("usage: executors retire <executor_id>")
+        if not ledger.retire_executor(args.target):
+            raise ValueError("no active executor {}".format(args.target))
+        _emit({"retired": args.target}, args.json,
+              lambda _p: print("retired {} (it comes back if it reports again)".format(args.target)))
+        return 0
+    if args.action == "waive":
+        reason = " ".join(args.reason).strip()
+        if not args.target or not reason:
+            raise ValueError("usage: executors waive <sub> <reason...>")
+        ledger.set_executor_waiver(args.target, reason)
+        _emit({"waived": args.target, "reason": reason}, args.json,
+              lambda _p: print("{}: runs without an executor on purpose ({})".format(args.target, reason)))
+        return 0
+    if args.action == "unwaive":
+        if not args.target:
+            raise ValueError("usage: executors unwaive <sub>")
+        cleared = ledger.clear_executor_waiver(args.target)
+        _emit({"unwaived": args.target, "had_waiver": cleared}, args.json,
+              lambda _p: print("{}: waiver {}".format(args.target, "cleared" if cleared else "not set")))
+        return 0
+
+    from .executors import age_text, parse_ts
+
+    health = ledger.executor_health()
+    retired = [r for r in ledger.list_executors() if r.get("retired_at")]
+    if args.json:
+        _emit({"accounts": health["accounts"], "orphans": health["orphans"],
+               "problems": [{"scope": a, "problem": b} for a, b in health["problems"]],
+               "retired": retired}, True)
+        return 0
+    fmt = "{:7s} {:8s} {}  {:11s} {:>6s} {:>7s}  {}"
+    rows = []
+    for sub_id, entry in sorted(health["accounts"].items()):
+        for r in entry["executors"]:
+            due = parse_ts(r.get("expect_next_by"))
+            rows.append((sub_id, r["state"], r["executor_id"], r.get("kind") or "",
+                         str(r.get("pid") or "-"),
+                         age_text(r["age_s"]) if r.get("age_s") is not None else "-",
+                         "{} · next by {}".format(r.get("message") or "", due.strftime("%m-%d %H:%M UTC")
+                                                  if due else "?").strip(" ·")))
+        if not entry["executors"]:
+            rows.append((sub_id, entry["state"], "-", "", "", "", entry["summary"]))
+    for r in health["orphans"]:
+        rows.append(("({})".format(r.get("sub_account_id")), "orphan", r["executor_id"],
+                     r.get("kind") or "", str(r.get("pid") or "-"),
+                     age_text(r["age_s"]) if r.get("age_s") is not None else "-", "子账户不存在或已停用"))
+    width = max([_display_width("executor_id")] + [_display_width(r[2]) for r in rows])
+    print(fmt.format("sub", "state", _pad("executor_id", width), "kind", "pid", "last", "message"))
+    for r in rows:
+        line = fmt.format(r[0], r[1], _pad(r[2], width), r[3], r[4], r[5], r[6])
+        print(_red(line) if r[1] in ("missing", "stale", "error", "orphan") else line)
+    if retired:
+        print("retired: {}".format(", ".join(r["executor_id"] for r in retired)))
+    return 0
+
+
 def _ops(args, ledger, router, reconciler) -> int:
     """Operator actions: reads or single-statement light writes that coexist
     with a running daemon (same posture as the trial's `ops`)."""
@@ -840,7 +964,8 @@ def _build_stack_from_env():
     words = [a for a in sys.argv[1:] if not a.startswith("-")]
     cmd = words[0] if words else ""
     sub = words[1] if len(words) > 1 else ""
-    if cmd in _VIEW_COMMANDS or cmd == "ops" or (cmd == "accounts" and sub in ("list", "show")):
+    if cmd in _VIEW_COMMANDS or cmd in ("ops", "executors") or (
+            cmd == "accounts" and sub in ("list", "show")):
         os.environ.setdefault("SUBLEDGER_READONLY", "1")
     return _build_stack()
 

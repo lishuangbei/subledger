@@ -202,6 +202,25 @@ CLI 命令）固定用 `IB_CLIENT_ID`；只读视图命令自动用 `900 + pid %
 - 同一 IB 用户名同一时刻只能有一个 Gateway/TWS 会话（paper 与 live 是两套
   用户名，可各开一个 Gateway 实例，端口默认就不同：4002 / 4001）
 
+## 执行器心跳（`executors.py`，2026-10-05）
+
+规则：**每个 active 子账户都必须有一个在运行的执行器**。执行器就是替这个子账户下单的东西：
+REST 上的独立程序（strategy-executer、hermes live4731），或 daemon 进程内托管的策略模块（trial）。
+
+- 每个执行器**自己**报心跳：`POST /executors/heartbeat`
+  `{executor_id, sub_account_id, name, kind, pid, status: ok|error, message, interval_s, expect_next_by}`；
+  进程内策略由宿主 daemon 调 `Ledger.record_executor_heartbeat()` 代报。每次心跳承诺下一次的最晚时间
+  （默认 now + interval_s，定时任务可直接给 `expect_next_by`）
+- **统一判定**（`subledger.executors.evaluate`，纯函数，CLI / REST / watchdog 共用）：
+  执行器 ok / stale（承诺的下一次心跳过了 60 s 宽限还没来）/ error（按时来了但报告上次运行失败）；
+  子账户 ok / problem（任一执行器 stale 或 error）/ missing（没有执行器报心跳）/ waived（明确登记为无人值守）；
+  为不存在或已停用子账户报心跳的执行器是 orphan。已停用（inactive）的子账户不检查
+- `subld status`：每个子账户一列 executor，有问题标红并在表下列出；`--json` 带 `executor` 与 `executor_problems`
+- `subld executors`：列出全部执行器；`retire <executor_id>` 下线一个执行器（它再报心跳就自动回来）；
+  `waive <sub> <理由>` / `unwaive <sub>` 登记 / 取消"无人值守"。都是轻写，daemon 运行中可用
+- 告警：trial 的 `ops/watchdog.py` 只读各账本做同一判定并推送（实盘盘中 / 开盘前 critical，其余 warn）
+- 纯元数据：心跳从不影响下单、记账和对账；豁免单独一张表，daemon 的整行写不会把它冲掉
+
 ## 已知简化与边界（review 时重点看这里）
 
 1. **保证金模型是 Reg-T 简化版**（v0.4.0 起 equity 基准）：

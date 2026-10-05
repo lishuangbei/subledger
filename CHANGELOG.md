@@ -1,5 +1,16 @@
 # Changelog
 
+## unreleased — 2026-10-05:执行器心跳，每个子账户都要有在运行的执行器
+
+- 起因:trial 的 4731 一直拿着 QQQ，被怀疑执行器没了；查下来执行器在跑，但谁也看不出来，
+  watchdog 的手写清单只覆盖两个实盘 4757 执行器
+- 新增 `executors` / `executor_waivers` 两张表(启动时自动建，旧账本原地升级);`Ledger.record_executor_heartbeat`、
+  `list_executors`、`retire_executor`、`set/clear_executor_waiver`、`executor_health`
+- REST:`POST /executors/heartbeat`、`GET /executors`、`DELETE /executors/{id}`
+- `subledger.executors`:统一判定(ok / stale / error;子账户 ok / problem / missing / waived;orphan)
+- CLI:`status` 每个子账户标上执行器，有问题标红并逐条列出;新命令 `executors [retire|waive|unwaive]`
+- 纯元数据，不碰下单、记账和对账。12 个新测试。194 tests
+
 ## unreleased — 2026-10-02:IB 报价只认订阅后的新 tick;个别无数据标的不再拖满等待
 
 - ib_async 每个合约只有一个 Ticker,线路被 LRU 挤掉后再订阅,会把**旧** Ticker 连同旧价格还回来;

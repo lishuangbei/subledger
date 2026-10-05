@@ -125,6 +125,29 @@ CREATE TABLE IF NOT EXISTS equity_snapshots (
     unrealized_pnl TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_equity_sub_at ON equity_snapshots (sub_account_id, at);
+-- Executor heartbeats (subledger.executors): one row per reporting executor.
+-- Metadata only; never part of balances, reconciliation or booking.
+CREATE TABLE IF NOT EXISTS executors (
+    executor_id TEXT PRIMARY KEY,
+    sub_account_id TEXT NOT NULL,
+    name TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL DEFAULT 'external',
+    pid INTEGER,
+    status TEXT NOT NULL DEFAULT 'ok',
+    message TEXT NOT NULL DEFAULT '',
+    interval_s INTEGER NOT NULL DEFAULT 300,
+    expect_next_by TEXT NOT NULL,
+    first_seen_at TEXT NOT NULL,
+    last_heartbeat_at TEXT NOT NULL,
+    retired_at TEXT
+);
+-- Sub-accounts deliberately run without an executor. Its own table, so the
+-- full-row sub_accounts writes of a running daemon can never undo a waiver.
+CREATE TABLE IF NOT EXISTS executor_waivers (
+    sub_account_id TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    set_at TEXT NOT NULL
+);
 """
 
 # Columns added after the original schema; applied via ALTER TABLE so an
@@ -807,6 +830,98 @@ class Ledger:
                 (at, int(ok), report_json),
             )
             self._conn.commit()
+
+    # -- executor heartbeats (see subledger.executors) ---------------------
+
+    def record_executor_heartbeat(self, executor_id: str, sub_account_id: str, *,
+                                  name: str = "", kind: str = "external",
+                                  pid: Optional[int] = None, status: str = "ok",
+                                  message: str = "", interval_s: Optional[int] = None,
+                                  expect_next_by: Optional[str] = None,
+                                  at: Optional[str] = None) -> dict:
+        """Upsert one executor's heartbeat. The heartbeat promises the next
+        one by `expect_next_by` (default: now + interval_s). A heartbeat from
+        a retired executor brings it back."""
+        from . import executors as _ex
+
+        executor_id = str(executor_id or "").strip()
+        sub_account_id = str(sub_account_id or "").strip()
+        if not executor_id or not sub_account_id:
+            raise ValueError("executor_id and sub_account_id are required")
+        status = str(status or "ok").strip().lower()
+        if status not in _ex.EXECUTOR_STATUSES:
+            message = "status {!r}: {}".format(status, message or "")
+            status = "error"
+        interval = _ex.clamp_interval(interval_s if interval_s is not None
+                                      else _ex.DEFAULT_INTERVAL_S)
+        now = _ex.parse_ts(at) or _ex.utc_now()
+        due = _ex.parse_ts(expect_next_by)
+        if due is None or due <= now:
+            due = now + _dt.timedelta(seconds=interval)
+        due = min(due, now + _dt.timedelta(seconds=_ex.MAX_INTERVAL_S))
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO executors (executor_id, sub_account_id, name, kind, pid, status, "
+                "message, interval_s, expect_next_by, first_seen_at, last_heartbeat_at, retired_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL) "
+                "ON CONFLICT(executor_id) DO UPDATE SET sub_account_id=excluded.sub_account_id, "
+                "name=excluded.name, kind=excluded.kind, pid=excluded.pid, status=excluded.status, "
+                "message=excluded.message, interval_s=excluded.interval_s, "
+                "expect_next_by=excluded.expect_next_by, "
+                "last_heartbeat_at=excluded.last_heartbeat_at, retired_at=NULL",
+                (executor_id, sub_account_id, str(name or "")[:80], str(kind or "external")[:20],
+                 None if pid is None else int(pid), status, str(message or "")[:300], interval,
+                 due.isoformat(), now.isoformat(), now.isoformat()))
+            self._conn.commit()
+            row = self._conn.execute("SELECT * FROM executors WHERE executor_id=?",
+                                     (executor_id,)).fetchone()
+        return dict(row)
+
+    def list_executors(self, include_retired: bool = True) -> List[dict]:
+        sql = "SELECT * FROM executors"
+        if not include_retired:
+            sql += " WHERE retired_at IS NULL"
+        return [dict(r) for r in self._conn.execute(sql + " ORDER BY sub_account_id, executor_id")]
+
+    def retire_executor(self, executor_id: str) -> bool:
+        """Stop expecting heartbeats from this executor (decommissioned). It
+        comes back by itself if it ever reports again."""
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE executors SET retired_at=? WHERE executor_id=? AND retired_at IS NULL",
+                (_utc_now(), executor_id))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def executor_waivers(self) -> Dict[str, str]:
+        return {r["sub_account_id"]: r["reason"]
+                for r in self._conn.execute("SELECT * FROM executor_waivers")}
+
+    def set_executor_waiver(self, sub_account_id: str, reason: str) -> None:
+        reason = str(reason or "").strip()
+        if not reason:
+            raise ValueError("a waiver needs a reason")
+        self.get_sub_account(sub_account_id)          # KeyError if unknown
+        with self._lock:
+            self._conn.execute(
+                "INSERT INTO executor_waivers (sub_account_id, reason, set_at) VALUES (?, ?, ?) "
+                "ON CONFLICT(sub_account_id) DO UPDATE SET reason=excluded.reason, "
+                "set_at=excluded.set_at", (sub_account_id, reason[:200], _utc_now()))
+            self._conn.commit()
+
+    def clear_executor_waiver(self, sub_account_id: str) -> bool:
+        with self._lock:
+            cur = self._conn.execute("DELETE FROM executor_waivers WHERE sub_account_id=?",
+                                     (sub_account_id,))
+            self._conn.commit()
+        return cur.rowcount > 0
+
+    def executor_health(self, now=None) -> dict:
+        """subledger.executors.evaluate() over this ledger."""
+        from . import executors as _ex
+
+        subs = [{"id": a.id, "active": a.active} for a in self.list_sub_accounts()]
+        return _ex.evaluate(subs, self.list_executors(), self.executor_waivers(), now=now)
 
     def latest_reconciliation(self) -> Optional[dict]:
         row = self._conn.execute(
