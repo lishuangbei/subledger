@@ -1,5 +1,10 @@
 # Changelog
 
+## unreleased — 2026-10-05:执行器必须独立于 subld daemon
+
+- 规则(owner 决定):执行器只能是 REST 上的独立进程，daemon 不再托管策略。`kind=in-process` 的心跳
+  在 `subledger.executors` 里一律记为问题(子账户标红，watchdog 告警)，防止回退。195 tests
+
 ## unreleased — 2026-10-05:执行器心跳，每个子账户都要有在运行的执行器
 
 - 起因:trial 的 4731 一直拿着 QQQ，被怀疑执行器没了；查下来执行器在跑，但谁也看不出来，

@@ -204,12 +204,13 @@ CLI 命令）固定用 `IB_CLIENT_ID`；只读视图命令自动用 `900 + pid %
 
 ## 执行器心跳（`executors.py`，2026-10-05）
 
-规则：**每个 active 子账户都必须有一个在运行的执行器**。执行器就是替这个子账户下单的东西：
-REST 上的独立程序（strategy-executer、hermes live4731），或 daemon 进程内托管的策略模块（trial）。
+规则：**每个 active 子账户都必须有一个在运行的执行器**，且**执行器必须是独立于 subld daemon 的进程**
+（2026-10-05 起；trial daemon 已不再托管策略）。执行器就是替这个子账户下单的程序，经 REST 下单，
+如 strategy-executer、hermes live4731。`kind=in-process` 的心跳一律算问题。
 
 - 每个执行器**自己**报心跳：`POST /executors/heartbeat`
   `{executor_id, sub_account_id, name, kind, pid, status: ok|error, message, interval_s, expect_next_by}`；
-  进程内策略由宿主 daemon 调 `Ledger.record_executor_heartbeat()` 代报。每次心跳承诺下一次的最晚时间
+  每次心跳承诺下一次的最晚时间
   （默认 now + interval_s，定时任务可直接给 `expect_next_by`）
 - **统一判定**（`subledger.executors.evaluate`，纯函数，CLI / REST / watchdog 共用）：
   执行器 ok / stale（承诺的下一次心跳过了 60 s 宽限还没来）/ error（按时来了但报告上次运行失败）；

@@ -79,6 +79,16 @@ class HealthRuleTests(unittest.TestCase):
         self.assertIn("×2", entry["summary"])
         self.assertIn("心跳超时", entry["summary"])
 
+    def test_in_process_executor_breaks_the_rule(self):
+        # executors must be independent of the subld daemon (2026-10-05)
+        subs = [{"id": "a1", "active": True}]
+        hosted = dict(row(name="trial daemon a1"), kind="in-process")
+        out = ex.evaluate(subs, [hosted], now=T0 + dt.timedelta(seconds=5))
+        entry = out["accounts"]["a1"]
+        self.assertEqual(entry["state"], ex.PROBLEM)
+        self.assertIn("独立进程", entry["problems"][0])
+        self.assertIn("在 daemon 内", entry["summary"])
+
     def test_waiver_does_not_hide_a_broken_executor(self):
         subs = [{"id": "a1", "active": True}]
         out = ex.evaluate(subs, [row(status="error")], {"a1": "x"}, now=T0)

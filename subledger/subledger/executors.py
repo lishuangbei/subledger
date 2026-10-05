@@ -13,6 +13,10 @@ the next one by `expect_next_by`. One rule, here, judges them all, so
            or its scheduler stopped running it
   error    on time, but the executor reports that its last run failed
 
+Executors must run as independent processes, never inside the subld
+daemon (owner rule, 2026-10-05): a heartbeat of kind `in-process` is a
+problem in itself, whatever its timing.
+
 A sub-account is `missing` when no executor reports for it, unless it is
 explicitly waived (`subld executors waive <sub> <reason>`), and `problem`
 when any of its executors is stale or in error. Executors reporting for a
@@ -35,6 +39,7 @@ MAX_INTERVAL_S = 8 * 24 * 3600     # a weekly scheduled job, plus slack
 OK, STALE, ERROR, RETIRED = "ok", "stale", "error", "retired"
 MISSING, WAIVED, PROBLEM = "missing", "waived", "problem"
 EXECUTOR_STATUSES = ("ok", "error")
+IN_PROCESS = "in-process"          # hosted inside a daemon: not allowed
 
 
 def parse_ts(value) -> Optional[_dt.datetime]:
@@ -94,6 +99,9 @@ def _describe(row: dict, now: _dt.datetime) -> dict:
             name, age_text(age or 0), age_text(clamp_interval(row.get("interval_s"))))
     elif state == ERROR:
         out["problem"] = "{} 报告出错：{}".format(name, row.get("message") or "(无说明)")
+    if state in (OK, ERROR) and (row.get("kind") or "") == IN_PROCESS:
+        text = "{} 跑在 subld daemon 进程内：执行器必须是独立进程".format(name)
+        out["problem"] = "{}；{}".format(out["problem"], text) if out.get("problem") else text
     return out
 
 
@@ -152,11 +160,15 @@ def _summary(rows: List[dict]) -> str:
         groups.setdefault(r.get("name") or r["executor_id"], []).append(r)
     parts = []
     for name, members in sorted(groups.items()):
-        bad = [m for m in members if m["state"] in (STALE, ERROR)]
+        bad = [m for m in members if m.get("problem")]
         count = " ×{}".format(len(members)) if len(members) > 1 else ""
         if bad:
-            worst = STALE if any(m["state"] == STALE for m in bad) else ERROR
-            detail = "心跳超时" if worst == STALE else "出错"
+            if any(m["state"] == STALE for m in bad):
+                detail = "心跳超时"
+            elif any(m["state"] == ERROR for m in bad):
+                detail = "出错"
+            else:
+                detail = "在 daemon 内"
             parts.append("✗ {}{} {}".format(name, count, detail))
         else:
             freshest = min((m["age_s"] for m in members if m["age_s"] is not None), default=0)
