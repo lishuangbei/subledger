@@ -23,6 +23,7 @@ from __future__ import annotations
 import datetime as _dt
 import json
 import logging
+import time
 from decimal import Decimal
 from typing import Optional
 
@@ -42,6 +43,7 @@ class Reconciler:
         qty_tolerance: Decimal = Decimal("0.000001"),
         halt_on_drift: bool = False,
         halt_min_cash_drift: Optional[Decimal] = None,
+        confirm_delay_s: float = 0.0,
     ):
         self.ledger = ledger
         self.broker = broker
@@ -49,8 +51,40 @@ class Reconciler:
         self.qty_tolerance = qty_tolerance
         self.halt_on_drift = halt_on_drift
         self.halt_min_cash_drift = halt_min_cash_drift
+        # > 0: a failing check is confirmed by a second one this many seconds
+        # later before it is recorded or can halt (see run()). Daemons set it.
+        self.confirm_delay_s = float(confirm_delay_s or 0)
 
     def run(self) -> ReconciliationReport:
+        """Compare ledger and broker, record the result, halt if warranted.
+
+        A fill the broker already reports but the order stream has not
+        booked yet, or a commission charged with a fill but not attributed
+        yet, looks exactly like drift for a split second (liveIB 2026-10-06
+        09:31 ET: the 5-minute reconcile met a SHOP fill mid-booking, saw an
+        unknown position and halted, 7 ms before the fill's protection order,
+        which the halt then rejected). With confirm_delay_s set, a failing
+        check waits that long, books newly published cash activities, and
+        checks again from fresh snapshots; only that second result is
+        recorded and can halt. Real drift is still there the second time."""
+        report = self._check()
+        if not report.ok and self.confirm_delay_s > 0:
+            first = "; ".join("[{}] {}".format(d.kind, d.detail) for d in report.drifts)[:300]
+            logger.warning("reconcile: %s drift(s) found; re-checking in %.0fs before acting: %s",
+                           len(report.drifts), self.confirm_delay_s, first)
+            time.sleep(self.confirm_delay_s)
+            try:
+                self.attribute_cash_activities()
+            except Exception as exc:            # attribution must not block the re-check
+                logger.warning("reconcile re-check: could not attribute cash activities: %s", exc)
+            report = self._check()
+            if report.ok:
+                logger.warning("reconcile: transient drift cleared on re-check "
+                               "(fill or fee in flight): %s", first)
+        self._record(report)
+        return report
+
+    def _check(self) -> ReconciliationReport:
         now = self._now()
         at = now.isoformat()
         drifts = []
@@ -158,6 +192,10 @@ class Reconciler:
             acknowledged_orders_skipped=acknowledged_skipped,
             pending_fees=pending_fees or ZERO,
         )
+        return report
+
+    def _record(self, report: ReconciliationReport) -> None:
+        at = report.at
         self.ledger.save_reconciliation(
             at,
             report.ok,
@@ -181,7 +219,6 @@ class Reconciler:
             elif self.halt_on_drift:
                 logger.warning("cash drift %s is below the halt threshold %s: reported, not halted",
                                report.expected_cash - report.broker_cash, self.halt_min_cash_drift)
-        return report
 
     @staticmethod
     def _now() -> "_dt.datetime":

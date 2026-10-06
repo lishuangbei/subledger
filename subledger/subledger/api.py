@@ -159,6 +159,8 @@ def _build_stack():
             Decimal(os.environ["SUBLEDGER_HALT_MIN_CASH_DRIFT"])
             if os.environ.get("SUBLEDGER_HALT_MIN_CASH_DRIFT") else None
         ),
+        # confirm a failing check before recording / halting (fills in flight)
+        confirm_delay_s=float(os.environ.get("SUBLEDGER_RECONCILE_CONFIRM_S", "5")),
     )
     return ledger, broker, router, reconciler
 
