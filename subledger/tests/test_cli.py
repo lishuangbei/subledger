@@ -98,6 +98,40 @@ class CliTests(unittest.TestCase):
         rows = json.loads(out)
         self.assertEqual(rows[0]["symbol"], "AAPL")
         self.assertEqual(rows[0]["qty"], "5")
+        self.assertIsNone(rows[0]["day_pct"])      # venue gave no previous close
+
+    def test_positions_daily_return(self):
+        import os
+        from unittest import mock
+
+        invoke(self.stack, "accounts", "create", "alpha", "--allocation", "50000")
+        for symbol in ("AAPL", "MSFT"):
+            self.broker.set_price(symbol, D("100"))
+            self.router.place_order(OrderRequest("alpha", symbol, OrderSide.BUY, D("5")))
+        self.broker.prev_closes = {"AAPL": D("98"), "MSFT": D("104")}
+        self.broker.set_price("AAPL", D("101"))
+        code, out = invoke(self.stack, "--json", "positions", "--sub", "alpha")
+        rows = {r["symbol"]: r for r in json.loads(out)}
+        self.assertEqual(rows["AAPL"]["day_pct"], "3.06")      # 101 / 98
+        self.assertEqual(rows["MSFT"]["day_pct"], "-3.85")     # 100 / 104
+        self.assertEqual(rows["AAPL"]["prev_close"], "98")
+        with mock.patch.dict(os.environ, {"SUBLEDGER_COLOR": "1", "NO_COLOR": ""}):
+            code, out = invoke(self.stack, "positions", "--sub", "alpha")
+        self.assertIn("day%", out)
+        self.assertIn("\033[48;5;", out)                       # painted
+        self.assertIn("+3.06%", out)
+        self.assertIn("-3.85%", out)
+
+    def test_positions_survive_day_change_failure(self):
+        invoke(self.stack, "accounts", "create", "alpha", "--allocation", "50000")
+        self.broker.set_price("AAPL", D("100"))
+        self.router.place_order(OrderRequest("alpha", "AAPL", OrderSide.BUY, D("5")))
+        def boom(symbols):
+            raise RuntimeError("data outage")
+        self.broker.day_changes = boom
+        code, out = invoke(self.stack, "positions", "--sub", "alpha")
+        self.assertEqual(code, 0)
+        self.assertIn("AAPL", out)
 
 
 if __name__ == "__main__":

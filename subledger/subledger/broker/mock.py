@@ -48,6 +48,7 @@ class MockBroker(BrokerAdapter):
         self.cash = cash
         self.positions: Dict[str, Dict[str, Decimal]] = {}  # symbol -> {qty, avg}
         self.prices: Dict[str, Decimal] = {}
+        self.prev_closes: Dict[str, Decimal] = {}
         self.orders: Dict[str, dict] = {}
         self._seq = itertools.count(1)
         self.fill_market_orders = True
@@ -256,6 +257,7 @@ class MockBroker(BrokerAdapter):
                 qty=p["qty"],
                 avg_entry_price=p["avg"],
                 current_price=self.prices.get(s, p["avg"]),
+                lastday_price=self.prev_closes.get(s, ZERO),
             )
             for s, p in self.positions.items()
             if p["qty"] != ZERO

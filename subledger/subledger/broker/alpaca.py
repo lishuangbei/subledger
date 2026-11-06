@@ -438,6 +438,7 @@ class AlpacaBroker(BrokerAdapter):
                 qty=Decimal(str(p.qty)),
                 avg_entry_price=Decimal(str(p.avg_entry_price)),
                 current_price=Decimal(str(p.current_price or p.avg_entry_price)),
+                lastday_price=Decimal(str(p.lastday_price or 0)),
             )
             for p in raw_positions
         ]

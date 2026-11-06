@@ -29,8 +29,9 @@ Commands
            open orders, settings
   positions [--sub ID] [--broker]
            ledger positions grouped by sub-account (with per-account value
-           subtotals); --broker shows the REAL account's net positions with
-           the ledger aggregate for comparison
+           subtotals; day% = today's return vs the previous close,
+           coloured); --broker shows the REAL account's net positions
+           with the ledger aggregate for comparison
   equity   [--sub ID] performance view: current equity, today's P&L,
            total P&L, max drawdown, sparkline (built from the per-minute
            history the daemon records). --raw dumps the raw time series
@@ -428,19 +429,47 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
                                      _money(r["avg_entry"]), _money(r["current"]),
                                      _money(r["market_value"]), flag))
             return 0
+        held = [p for p in ledger.list_positions(args.sub) if p.qty != 0 or p.reserved_qty != 0]
+        # daily return per symbol: the venue's previous close vs its current
+        # price (not the ledger's last mark, which may be minutes old).
+        # Best effort: a data outage just leaves the column blank.
+        try:
+            changes = broker.day_changes(sorted({p.symbol for p in held})) if held else {}
+        except Exception:
+            changes = {}
+
+        def day_pct(symbol):
+            if symbol not in changes:
+                return None
+            prev, now = changes[symbol]
+            return str(((now / prev - 1) * 100).quantize(Decimal("0.01")))
+
         rows = [{
             "sub_account_id": p.sub_account_id, "symbol": p.symbol,
             "qty": str(p.qty), "reserved_qty": str(p.reserved_qty),
             "avg_cost": str(p.avg_cost), "last_price": str(p.last_price),
             "unrealized_pnl": str(p.unrealized_pnl),
-        } for p in ledger.list_positions(args.sub) if p.qty != 0 or p.reserved_qty != 0]
+            "prev_close": str(changes[p.symbol][0]) if p.symbol in changes else None,
+            "day_pct": day_pct(p.symbol),
+        } for p in held]
 
         def _positions_table(items):
             from collections import OrderedDict
             groups = OrderedDict()
             for r in items:
                 groups.setdefault(r["sub_account_id"], []).append(r)
-            fmt = "  {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>13s} {:>13s}"
+            fmt = "  {:7s} {:>8s} {:>9s} {:>12s} {:>12s} {:>13s} {:>13s} {:>8s}"
+            colour = _returns_colour_enabled()
+
+            def day_cell(pct):
+                if pct is None:
+                    return "-"
+                body = ("+" if Decimal(pct) > 0 else "") + pct + "%"
+                if not colour:
+                    return body
+                # pad before painting: format() would count the escape codes
+                return " " * max(0, 8 - len(body)) + _paint_return(
+                    body, "today", Decimal(pct), True)
             accounts = [a for a in ledger.list_sub_accounts()
                         if args.sub in (None, a.id)]
             known = {a.id for a in accounts}
@@ -455,12 +484,12 @@ def _dispatch(args, ledger, broker, router, reconciler=None) -> int:
                     _money(value + acct.cash), _money(upnl)))
                 if rows_:
                     print(fmt.format("symbol", "qty", "reserved",
-                                     "avg_cost", "last", "mkt_value", "uPnL"))
+                                     "avg_cost", "last", "mkt_value", "uPnL", "day%"))
                 for r in rows_:
                     print(fmt.format(r["symbol"], r["qty"], r["reserved_qty"],
                                      _money(r["avg_cost"]), _money(r["last_price"]),
                                      _money(Decimal(r["qty"]) * Decimal(r["last_price"])),
-                                     _money(r["unrealized_pnl"])))
+                                     _money(r["unrealized_pnl"]), day_cell(r["day_pct"])))
                 print()
             for sub_id, rows_ in groups.items():   # rows for unknown accounts
                 if sub_id not in known:

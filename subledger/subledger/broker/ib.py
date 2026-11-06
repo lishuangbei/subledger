@@ -1043,6 +1043,28 @@ class IBBroker(BrokerAdapter):
                 pass
         return marks
 
+    def day_changes(self, symbols: List[str]) -> Dict[str, Tuple[Decimal, Decimal]]:
+        """The streaming lines last_prices opens also carry the previous
+        session's close (ticker.close); pair it with the fresh mark."""
+        wanted = [s for s in symbols if s]
+        if not wanted:
+            return {}
+        try:
+            return self._call(self._day_changes, wanted)
+        except Exception as exc:
+            logger.warning("ib day_changes failed: %s", exc)
+            return {}
+
+    async def _day_changes(self, symbols: List[str]) -> Dict[str, Tuple[Decimal, Decimal]]:
+        marks = await self._last_prices(symbols)
+        out: Dict[str, Tuple[Decimal, Decimal]] = {}
+        for symbol, price in marks.items():
+            ticker = self._mkt.get(symbol)
+            close = _num(getattr(ticker, "close", 0.0)) if ticker is not None else 0.0
+            if close > 0:
+                out[symbol] = (_dec(close), price)
+        return out
+
     async def _last_prices(self, symbols: List[str]) -> Dict[str, Decimal]:
         """Marks from STREAMING market-data lines that stay subscribed: a
         snapshot request (reqTickers) waits ~10-13s per batch on delayed data,

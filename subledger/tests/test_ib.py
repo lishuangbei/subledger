@@ -653,6 +653,13 @@ class IBBrokerTests(unittest.TestCase):
         self.broker.last_prices(["AAPL"])
         self.assertEqual(self.fake.subscribed.count("AAPL"), 1)
 
+    def test_day_changes_pair_previous_close_with_fresh_mark(self):
+        self.fake.tickers = {"AAPL": {"last": 101.0, "bid": 100.9, "ask": 101.1, "close": 98.0},
+                             "MSFT": {"last": 300.0}}          # no close tick: absent
+        self.broker._tick_wait = 0.2
+        self.assertEqual(self.broker.day_changes(["AAPL", "MSFT"]),
+                         {"AAPL": (D("98"), D("101"))})
+
     def test_more_symbols_than_market_data_lines(self):
         # regression 2026-10-02: a 100-symbol call evicted its own first lines
         # and raised KeyError, so the pre-close scan saw zero quotes

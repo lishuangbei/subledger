@@ -1,5 +1,15 @@
 # Changelog
 
+## unreleased — 2026-11-06:`positions` 每个持仓标上当日涨跌(day%,带颜色)
+
+- 新增 `BrokerAdapter.day_changes(symbols) -> {symbol: (前收盘, 现价)}`;默认实现取持仓的
+  `BrokerPosition.lastday_price`(新字段,0 = 券商不提供)。Alpaca 用持仓自带的 `lastday_price`
+  (不多一次调用);IB 复用 `last_prices` 的行情线路，读 `ticker.close`;mock 用 `prev_closes`
+- `positions` 新增 `day%` 列：现价/前收盘 − 1,用券商现价而非账本的 last(后者可能是几分钟前的)。
+  颜色沿用 `returns` 的 today 档位(绿涨红跌，越深越大);`NO_COLOR` / 非终端不上色。
+  JSON 行新增 `prev_close`、`day_pct`(取不到为 null)。取价失败只留空，不影响持仓视图
+- 3 个新测试。202 tests
+
 ## unreleased — 2026-10-06:对账发现偏差先复核，再记录 / 急停
 
 - 事故:liveIB 美东 09:31 买入 2 股 SHOP，每 5 分钟一次的对账恰好在成交入账前的一瞬运行，

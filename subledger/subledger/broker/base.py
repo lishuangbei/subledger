@@ -10,7 +10,7 @@ import abc
 import datetime
 from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from ..models import OrderRequest
 
@@ -79,6 +79,8 @@ class BrokerPosition:
     qty: Decimal
     avg_entry_price: Decimal = Decimal("0")
     current_price: Decimal = Decimal("0")
+    # previous session's close (0 = venue doesn't say); daily return reference
+    lastday_price: Decimal = Decimal("0")
 
 
 @dataclass
@@ -193,3 +195,13 @@ class BrokerAdapter(abc.ABC):
             if pos.symbol in symbols and pos.current_price > Decimal("0"):
                 marks[pos.symbol] = pos.current_price
         return marks
+
+    def day_changes(self, symbols: List[str]) -> Dict[str, Tuple[Decimal, Decimal]]:
+        """symbol -> (previous close, current price), for a daily return.
+        Default: held positions whose venue reports the previous close;
+        symbols the venue can't price this way are simply absent."""
+        out: Dict[str, Tuple[Decimal, Decimal]] = {}
+        for pos in self.get_account().positions:
+            if pos.symbol in symbols and pos.lastday_price > 0 and pos.current_price > 0:
+                out[pos.symbol] = (pos.lastday_price, pos.current_price)
+        return out
